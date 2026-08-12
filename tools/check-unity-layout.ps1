@@ -28,7 +28,7 @@ if ($null -ne $gitCommand) {
 }
 $programFiles = [Environment]::GetEnvironmentVariable('ProgramFiles')
 if ($programFiles) {
-    $gitCandidates += Join-Path $programFiles 'Git\cmd\git.exe'
+    $gitCandidates += Join-Path $programFiles 'Git/cmd/git.exe'
 }
 $git = $gitCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
     Select-Object -First 1
@@ -130,21 +130,21 @@ foreach ($path in $repositoryFiles) {
     }
 }
 
-$projectRoot = Join-Path $repoRoot 'unity\Sunk'
-$projectVersionPath = Join-Path $projectRoot 'ProjectSettings\ProjectVersion.txt'
+$projectRoot = Join-Path $repoRoot 'unity/Sunk'
+$projectVersionPath = Join-Path $projectRoot 'ProjectSettings/ProjectVersion.txt'
 $projectVersion = Get-Content -LiteralPath $projectVersionPath -Raw
 Assert-Condition ($projectVersion -match '(?m)^m_EditorVersion: 6000\.0\.30f1\r?$') `
     'ProjectVersion.txt must pin Unity 6000.0.30f1.'
 Assert-Condition ($projectVersion -match '(?m)^m_EditorVersionWithRevision: 6000\.0\.30f1 \(62b05ba0686a\)\r?$') `
     'ProjectVersion.txt must pin the expected Unity revision.'
 
-$projectSettings = Get-Content -LiteralPath (Join-Path $projectRoot 'ProjectSettings\ProjectSettings.asset') -Raw
+$projectSettings = Get-Content -LiteralPath (Join-Path $projectRoot 'ProjectSettings/ProjectSettings.asset') -Raw
 Assert-Condition ($projectSettings -match '(?m)^  productName: Sunk\r?$') `
     'Unity Product Name must be Sunk.'
 Assert-Condition (-not ($projectSettings -match 'com\.unity\.template|Unity Technologies')) `
     'Unity template naming remains in ProjectSettings.asset.'
 
-$editorSettings = Get-Content -LiteralPath (Join-Path $projectRoot 'ProjectSettings\EditorSettings.asset') -Raw
+$editorSettings = Get-Content -LiteralPath (Join-Path $projectRoot 'ProjectSettings/EditorSettings.asset') -Raw
 Assert-Condition ($editorSettings -match '(?m)^  m_ProjectGenerationRootNamespace: Sunk\r?$') `
     'The C# root namespace must be Sunk.'
 Assert-Condition ($editorSettings -match '(?m)^  m_ExternalVersionControlSupport: Visible Meta Files\r?$') `
@@ -152,8 +152,8 @@ Assert-Condition ($editorSettings -match '(?m)^  m_ExternalVersionControlSupport
 Assert-Condition ($editorSettings -match '(?m)^  m_SerializationMode: 2\r?$') `
     'Unity assets must use Force Text serialization.'
 
-$manifestPath = Join-Path $projectRoot 'Packages\manifest.json'
-$lockPath = Join-Path $projectRoot 'Packages\packages-lock.json'
+$manifestPath = Join-Path $projectRoot 'Packages/manifest.json'
+$lockPath = Join-Path $projectRoot 'Packages/packages-lock.json'
 try {
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $null = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
