@@ -1,0 +1,24 @@
+name: Unity repository layout
+
+on:
+  push:
+    branches:
+      - unity
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  layout:
+    name: Validate isolated Unity workspace
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate Unity files and metadata
+        shell: pwsh
+        run: ./tools/check-unity-layout.ps1

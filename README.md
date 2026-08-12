@@ -1,66 +1,93 @@
-# Sunk
+# Sunk - Unity implementation
 
-Sunk is a cross-platform Rust desktop application that renders a procedural, transparent black hole
-as its primary interface. The project targets Windows (DX12) and macOS (Metal) through `wgpu` and
-`winit`.
+This branch is the Unity implementation of **Sunk**, a cross-platform desktop application whose
+primary interface is a procedural Gargantua-inspired black hole. It is an alternative to the Rust
+implementation on `main`; it is not a mixed Rust/Unity workspace.
 
-The current foundation provides:
+## Status
 
-- a transparent, borderless, always-on-top desktop window;
-- a procedural WGSL black-hole and accretion-disk prototype;
-- Windows DirectComposition presentation and transparent-surface capability checks;
-- a platform-independent interaction state machine;
-- ordered multi-file drop aggregation and a deterministic, path-free visual capture timeline;
-- adaptive render-quality tiers with hysteresis;
-- validated settings and a system-trash-only filesystem boundary;
-- Windows and macOS CI with a 50 MiB release-binary gate.
+- Phase 0 Unity foundation
+- Unity `6000.0.30f1` (Unity 6 LTS)
+- Universal Render Pipeline `17.0.1`
+- Windows IL2CPP module installed locally
+- Product code, native window integration, and file operations are not implemented yet
 
-The application does **not** delete or move files yet. A file drop only queues visual
-attraction/capture/orbit/event-horizon state and temporarily increases the black hole's response.
-The renderer never receives file paths. Permanent deletion is disabled by default and no
-permanent-delete executor is exposed.
+The checked-in scene and rendering settings come from the matching Unity 6 URP template. The first
+development milestone is the Gargantua renderer: event horizon, photon ring, compact accretion disk,
+Kerr-inspired lensing, Doppler beaming, and adaptive quality.
+
+## Worktree isolation
+
+| Branch | Local worktree | Active implementation |
+| --- | --- | --- |
+| `main` | `L:\item` | Rust / wgpu |
+| `unity` | `L:\Sunk-Unity` | Unity 6 / URP |
+
+Open only `L:\Sunk-Unity\unity\Sunk` in Unity Hub. Unity-generated folders such as `Library`,
+`Temp`, and `Logs` remain inside the Unity worktree and are ignored. Do not routinely merge the
+entire `unity` branch into `main`; shared changes must be reviewed and selected explicitly.
+
+See [the branch management rules](docs/development/BRANCHING.md) before moving files between the
+two implementations.
 
 ## Prerequisites
 
-- Rust `1.97.1` (selected automatically by `rust-toolchain.toml`)
-- Windows: Visual Studio 2022 Build Tools with the C++ workload and Windows SDK
-- macOS: current Xcode Command Line Tools
+- Unity Editor `6000.0.30f1`
+- Windows: Windows Build Support (IL2CPP), Visual Studio 2022 Build Tools, and Windows SDK
+- macOS: a matching Unity Editor installation and current Xcode command-line tools
 
 ## Develop
 
-```text
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo run -p sunk-app --bin sunk
+1. In Unity Hub, add and open `unity/Sunk`.
+2. Keep all product-owned assets under `Assets/Sunk` as that structure is introduced.
+3. Run the repository layout check before committing:
+
+```powershell
+pwsh -NoProfile -File tools/check-unity-layout.ps1
 ```
 
-Press `Esc` to exit the prototype.
+After Unity Personal is activated, verify the project headlessly:
 
-## Workspace
-
-```text
-crates/sunk-app         winit lifecycle and module orchestration
-crates/sunk-core        interaction state and adaptive quality policy
-crates/sunk-desktop     cross-platform window and input normalization
-crates/sunk-renderer    wgpu surface, pipeline, and procedural renderer
-crates/sunk-filesystem  inspection and move-to-trash boundary
-crates/sunk-settings    validated TOML settings model
-shaders/                     WGSL shader sources
-docs/                        architecture notes and delivery plan
+```powershell
+& 'C:\Program Files\Unity\Hub\Editor\6000.0.30f1\Editor\Unity.exe' `
+  -batchmode -quit -projectPath 'L:\Sunk-Unity\unity\Sunk' `
+  -logFile 'L:\Sunk-Unity\artifacts\unity-import.log'
 ```
 
-The product and technical baseline is
-[`Sunk_Desktop_Development_Document_v0.1.docx`](Sunk_Desktop_Development_Document_v0.1.docx).
+## Repository layout
 
-## Safety and scope
+```text
+unity/Sunk/                  Unity Hub project root
+  Assets/                    scenes, settings, and future Assets/Sunk product code
+  Packages/                  pinned Unity package manifest and lock file
+  ProjectSettings/           versioned Unity project settings
+docs/unity/                  Unity implementation specification
+docs/development/            branch and repository management rules
+native/windows/              future Windows native integration source
+native/macos/                future macOS native integration source
+tools/                       repository validation scripts
+```
 
-- The renderer never calls filesystem APIs.
-- Native per-file drag events are coalesced at the event-loop boundary, de-duplicated in first-seen
-  order, and validated as one atomic batch before visual work is queued.
-- Permanent deletion and uninstall are outside Phase 0.
-- Transparent composition requires a non-opaque swapchain mode; startup fails clearly if the
-  platform cannot provide one.
-- macOS transparency and Metal behavior must be smoke-tested on real macOS hardware or CI.
+## Naming
 
-Licensed under GPL-3.0-only. See [`LICENSE`](LICENSE).
+- Product name: `Sunk`
+- C# root namespace: `Sunk`
+- Future assemblies: `Sunk.Core`, `Sunk.Rendering`, `Sunk.Interaction`, and other `Sunk.*` modules
+- Windows output: `sunk.exe`
+- macOS output: `Sunk.app`
+- Bundle identifier: pending publisher identifier confirmation; do not invent one
+
+Domain names such as `BlackHoleModel`, Gargantua, Accretion Disk, Event Horizon, and Kerr remain
+part of the rendering model and are not legacy product names.
+
+## Safety and licensing
+
+File deletion and uninstall behavior are outside this foundation. Future file removal must default
+to the operating-system trash, permanent deletion must require explicit confirmation, and rendering
+code must never receive full filesystem paths.
+
+Licensed under GPL-3.0-only. See [LICENSE](LICENSE). Before distribution, review compatibility
+between the project license, Unity runtime terms, native plug-ins, and third-party packages.
+
+The Unity technical baseline is
+[Sunk Desktop Unity Development Document v0.2](docs/unity/Sunk_Desktop_Unity_Development_Document_v0.2.md).

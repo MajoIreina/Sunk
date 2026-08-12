@@ -1,8 +1,52 @@
 * text=auto eol=lf
+
+# Unity YAML and source files.
+*.meta text eol=lf whitespace=-trailing-space
+*.unity text eol=lf whitespace=-trailing-space
+*.prefab text eol=lf whitespace=-trailing-space
+*.asset text eol=lf whitespace=-trailing-space
+*.mat text eol=lf whitespace=-trailing-space
+*.controller text eol=lf whitespace=-trailing-space
+*.anim text eol=lf whitespace=-trailing-space
+*.asmdef text eol=lf
+*.asmref text eol=lf
+*.shader text eol=lf
+*.hlsl text eol=lf
+*.compute text eol=lf
+*.cs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+
+# Windows command files retain native line endings.
 *.bat text eol=crlf
 *.cmd text eol=crlf
-*.ps1 text eol=crlf
+*.ps1 text eol=lf
+
+# Documents and media.
 *.docx binary
+*.pdf binary
 *.png binary
+*.jpg binary
+*.jpeg binary
+*.tga binary
+*.psd binary
 *.ico binary
 *.icns binary
+*.fbx binary
+*.blend binary
+*.wav binary
+*.mp3 binary
+*.ogg binary
+*.ttf binary
+*.otf binary
+
+# Native plug-ins are tracked as opaque binaries when committed under Assets.
+*.dll binary
+*.dylib binary
+*.bundle binary
+*.lib binary
+*.a binary
+*.pdb binary

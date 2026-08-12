@@ -1,6 +1,43 @@
-/target/
-*.pdb
-*.dSYM/
-.DS_Store
+# Unity-generated state. The only Unity project is unity/Sunk.
+/unity/Sunk/[Ll]ibrary/
+/unity/Sunk/[Tt]emp/
+/unity/Sunk/[Oo]bj/
+/unity/Sunk/[Bb]uild/
+/unity/Sunk/[Bb]uilds/
+/unity/Sunk/[Ll]ogs/
+/unity/Sunk/[Uu]ser[Ss]ettings/
+/unity/Sunk/[Mm]emoryCaptures/
+/unity/Sunk/[Rr]ecordings/
+
+# Repository-local build output.
+/artifacts/
+/native/windows/build/
+/native/macos/build/
+
+# IDE-generated files.
+.vs/
 .idea/
 .vscode/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.opendb
+*.VC.db
+
+# Operating-system files.
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Crash reports and temporary files.
+sysinfo.txt
+*.tmp
+*.bak
+
+# Deliberately do not ignore *.meta, *.dll, or *.bundle: Unity assets and
+# native runtime plug-ins must remain version controlled.
