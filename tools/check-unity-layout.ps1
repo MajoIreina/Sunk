@@ -156,9 +156,19 @@ $manifestPath = Join-Path $projectRoot 'Packages/manifest.json'
 $lockPath = Join-Path $projectRoot 'Packages/packages-lock.json'
 try {
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    $null = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+    $packageLock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
 } catch {
     Fail "Unity package JSON is invalid: $($_.Exception.Message)"
+}
+$manifestDependencies = @($manifest.dependencies.PSObject.Properties)
+foreach ($dependency in $manifestDependencies) {
+    $lockedDependency = $packageLock.dependencies.PSObject.Properties[$dependency.Name]
+    Assert-Condition ($null -ne $lockedDependency) `
+        "Direct package is missing from packages-lock.json: $($dependency.Name)"
+    Assert-Condition ($lockedDependency.Value.version -eq $dependency.Value) `
+        "Direct package version differs between manifest and lock: $($dependency.Name)"
+    Assert-Condition ($lockedDependency.Value.depth -eq 0) `
+        "Direct package must have lock depth 0: $($dependency.Name)"
 }
 $urpProperty = $manifest.dependencies.PSObject.Properties['com.unity.render-pipelines.universal']
 Assert-Condition ($null -ne $urpProperty) 'The URP package is missing from manifest.json.'
