@@ -25,7 +25,8 @@ The prototype includes:
 - a narrow photon ring tied to the shadow boundary;
 - one thin procedural accretion disk with a radial temperature gradient;
 - continuous accretion-disk density integration with Beer-Lambert compositing;
-- compressed upper and lower higher-order images derived from that same integrated disk;
+- upper and lower higher-order images derived from real disk-plane crossings along the
+  same integrated ray paths;
 - Doppler brightening and color asymmetry;
 - approximate gravitational redshift;
 - Kerr-inspired finite-step ray bending, frame dragging, and a lensed procedural star field;
@@ -33,8 +34,10 @@ The prototype includes:
 - restrained bloom through the existing scene volume profile.
 
 The upper disk structure is deliberately treated as a secondary lensed image, not a
-second disk. Its height, thickness, span, and intensity are capped in
-`GargantuaSettings` so it cannot dominate the primary disk.
+second disk. Its radiance is attenuated by disk-plane passage order, emission radius,
+orbital winding, photon-orbit residence, and disk-face visibility so it cannot dominate
+the primary disk. The legacy height/thickness/span controls remain serialized for project
+compatibility; they no longer paint or clip a screen-space ellipse.
 
 ## Tuning
 
@@ -42,29 +45,32 @@ Edit `Assets/Sunk/Settings/GargantuaSettings.asset`. The defaults are the review
 baseline for this milestone. Keep the following invariants while tuning:
 
 ```text
-HorizonRadius < ApparentShadowRadius < DiskInnerRadius < DiskOuterRadius
+HorizonRadius < DiskInnerRadius < DiskOuterRadius
+HorizonRadius < ApparentShadowRadius < DiskOuterRadius
 SecondaryImageHeight <= 1.30 apparent shadow radii
 SecondaryImageThickness <= 0.15 apparent shadow radii
 SecondaryImageIntensity <= 0.65
 ```
 
-The reviewed defaults are intentionally tighter: `1.08` height, `0.040` half
-thickness, `1.72` horizontal half-span, and `0.28` intensity. The lower image is
-further compressed and dimmed so the two lensed images do not read as a second
-symmetrical disk.
+The reviewed transfer defaults use `0.115` for the first lensed image and `0.05` for
+higher orders. The physical disk uses an inner radius of `2.15 Rs`, outer radius of
+`9.10 Rs`, and half thickness of `0.048 Rs`. This permits the prograde inner disk to
+extend inside the apparent shadow radius while remaining outside the configured horizon.
 
 ## Numerical model and limits
 
 The current renderer traces 96 finite steps per pixel by default (configurable from 24
-to 128), with adaptive step length and a capped direction change. It combines a Schwarzschild-inspired bending
+to 192), with adaptive step length and a capped direction change. It combines a Schwarzschild-inspired bending
 term with a real-time frame-dragging approximation, records capture, escape, accumulated
-turn, orbital winding, and photon-sphere residency, and samples the disk along every ray
-segment using a Simpson density estimate.
+turn, orbital winding, photon-sphere residency, and actual disk-plane crossings, and
+samples the disk along every ray segment using a five-point composite Simpson density
+estimate.
 
 This model is intentionally described as **Kerr-inspired finite-step integration**. It is
 not an exact integration of the Kerr metric in Boyer-Lindquist coordinates and is not
-suitable for scientific measurement. The screen-space higher-order-image envelope remains
-as an art-direction safety bound so the upper image cannot grow into a second large disk.
+suitable for scientific measurement. Higher-order images are controlled only by integrated
+trajectory and disk-transfer quantities; there is no screen-space arc mask or brightness
+floor.
 
 ## Windows graphics backends
 
@@ -75,8 +81,9 @@ Windows Standalone is configured in this order:
 3. Direct3D 11 (compatibility fallback)
 
 The milestone is validated on both Direct3D 12 and native NVIDIA Vulkan. Their 1600x900
-Player captures are visually equivalent; the renderer does not depend on a backend-specific
-UV orientation or screen flip.
+Player captures are visually equivalent (`49.72 dB` PSNR and `0.9992` global SSIM in the
+current validation); the renderer does not depend on a backend-specific UV orientation or
+screen flip.
 
 Current Windows builds can log that URP's internal `DBufferClear` shader is unsupported.
 URP strips the unused DBuffer variants while its global resource table still references

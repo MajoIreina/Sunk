@@ -27,7 +27,7 @@ namespace Sunk.Tests.Rendering.Gargantua
         {
             Assert.That(settings.HasValidPhysicalOrdering, Is.True);
             Assert.That(settings.HorizonRadius, Is.LessThan(settings.ApparentShadowRadius));
-            Assert.That(settings.ApparentShadowRadius, Is.LessThan(settings.DiskInnerRadius));
+            Assert.That(settings.HorizonRadius, Is.LessThan(settings.DiskInnerRadius));
             Assert.That(settings.DiskInnerRadius, Is.LessThan(settings.DiskOuterRadius));
         }
 
@@ -51,6 +51,10 @@ namespace Sunk.Tests.Rendering.Gargantua
             Assert.That(settings.DopplerStrength, Is.GreaterThan(0.0f));
             Assert.That(settings.RedshiftStrength, Is.GreaterThan(0.0f));
             Assert.That(settings.DiskInclination, Is.GreaterThanOrEqualTo(80.0f));
+            Assert.That(settings.DiskInnerRadius, Is.LessThan(settings.ApparentShadowRadius));
+            Assert.That(settings.DiskOuterRadius, Is.LessThanOrEqualTo(9.5f));
+            Assert.That(settings.DiskHalfThickness, Is.LessThanOrEqualTo(0.05f));
+            Assert.That(settings.Turbulence, Is.GreaterThanOrEqualTo(0.9f));
             Assert.That(settings.HigherOrderIntensity, Is.LessThan(settings.SecondaryImageIntensity));
         }
 
@@ -60,6 +64,7 @@ namespace Sunk.Tests.Rendering.Gargantua
             Assert.That(settings.HasValidRayIntegration, Is.True);
             Assert.That(settings.RaySteps,
                 Is.InRange(GargantuaSettings.MinimumRaySteps, GargantuaSettings.MaximumRaySteps));
+            Assert.That(settings.RaySteps, Is.LessThanOrEqualTo(96));
             Assert.That(settings.MinStep, Is.GreaterThan(0.0f));
             Assert.That(settings.MaxStep, Is.GreaterThan(settings.MinStep));
             Assert.That(settings.MaxTurn,

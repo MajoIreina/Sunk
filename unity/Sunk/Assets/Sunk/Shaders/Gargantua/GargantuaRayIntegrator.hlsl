@@ -1,7 +1,7 @@
 #ifndef SUNK_GARGANTUA_RAY_INTEGRATOR_INCLUDED
 #define SUNK_GARGANTUA_RAY_INTEGRATOR_INCLUDED
 
-static const int SUNK_MAX_RAY_STEPS = 128;
+static const int SUNK_MAX_RAY_STEPS = 192;
 
 struct SunkRayTrace
 {
@@ -13,6 +13,8 @@ struct SunkRayTrace
     float totalTurn;
     float orbitalWinding;
     float photonResidency;
+    float diskPlaneCrossings;
+    float diskSide;
     float captured;
     float escaped;
     float2 sourceCoordinate;
@@ -42,31 +44,99 @@ float3 SunkDiskNormal()
     return SunkSafeNormalize(float3(0.0, sin(inclination), cos(inclination)));
 }
 
-float SunkHigherOrderEnvelope(float2 screenPosition, float projectedMainExtent)
+float3 SunkRayAcceleration(
+    float3 position,
+    float3 direction,
+    float3 spinAxis,
+    float horizonRadius,
+    float massScale,
+    float lensingScale)
 {
-    float upperSide = step(0.0, screenPosition.y);
-    float heightScale = lerp(0.78, 1.0, upperSide);
-    float spanScale = lerp(0.88, 1.0, upperSide);
-    float thicknessScale = lerp(0.72, 1.0, upperSide);
-    float height = min(_SecondaryImage.x, 1.30) * heightScale;
-    float span = min(_SecondaryImage.z, 1.72) * spanScale;
-    float halfSpan = max(_ScreenShadowRadius * span, 0.001);
-    float normalizedX = abs(screenPosition.x) / halfSpan;
-    float endpoint = 1.0 - smoothstep(0.94, 1.01, normalizedX);
-    float arc = sqrt(saturate(1.0 - normalizedX * normalizedX));
-    float arcHeight = _ScreenShadowRadius *
-        (0.10 + (height - 0.10) * arc);
-    float halfWidth = max(
-        _ScreenShadowRadius * min(_SecondaryImage.y, 0.15) *
-            thicknessScale * lerp(0.58, 1.0, saturate(normalizedX)),
-        0.0045);
-    float signedHeight = lerp(-arcHeight, arcHeight, upperSide);
-    float arcBand = SunkGaussian(screenPosition.y - signedHeight, halfWidth);
-    float separatedFromMain = smoothstep(
-        projectedMainExtent * 0.68,
-        projectedMainExtent * 1.22 + halfWidth,
-        abs(screenPosition.y));
-    return arcBand * endpoint * separatedFromMain * lerp(0.62, 1.0, upperSide);
+    float radiusSquared = max(dot(position, position), 0.000001);
+    float radius = sqrt(radiusSquared);
+    float inverseRadius = rsqrt(radiusSquared);
+    float inverseRadiusCubed = inverseRadius / radiusSquared;
+    float inverseRadiusFifth = inverseRadiusCubed / radiusSquared;
+    float3 angularMomentum = cross(position, direction);
+    float angularMomentumSquared = dot(angularMomentum, angularMomentum);
+    float3 schwarzschildAcceleration =
+        -1.5 * horizonRadius * massScale * angularMomentumSquared *
+        position * inverseRadiusFifth * lensingScale;
+
+    float3 radialDirection = position * inverseRadius;
+    float3 gravitomagneticField =
+        (3.0 * radialDirection * dot(radialDirection, spinAxis) - spinAxis) *
+        inverseRadiusCubed;
+    float3 frameDraggingAcceleration =
+        0.30 * _Spin * horizonRadius * horizonRadius *
+        cross(direction, gravitomagneticField) * lensingScale;
+    float3 acceleration = schwarzschildAcceleration + frameDraggingAcceleration;
+    return acceleration - direction * dot(acceleration, direction);
+}
+
+float SunkDiskOrderAttenuation(
+    SunkRayTrace state,
+    float diskPassage,
+    float diskRadius,
+    float crossingOrientation)
+{
+    // Plane passages form the discrete transfer-function order. Bending, azimuthal
+    // winding and photon-orbit dwell only provide continuous confidence for a highly
+    // lensed first passage; none of these quantities creates a screen-space image.
+    float discreteOrder = max(floor(diskPassage + 0.01) - 1.0, 0.0);
+    float windingOrder = state.orbitalWinding / SUNK_PI;
+    float secondaryBend = smoothstep(0.24, 0.62, state.totalTurn);
+    float secondaryOrbit = max(
+        smoothstep(0.16, 0.52, windingOrder),
+        smoothstep(0.08, 0.48, state.photonResidency));
+    float trajectorySecondary = max(
+        secondaryBend,
+        secondaryOrbit * smoothstep(0.14, 0.40, state.totalTurn));
+    float secondaryOrder = max(step(0.5, discreteOrder), trajectorySecondary);
+
+    float higherBend = smoothstep(0.78, 1.72, state.totalTurn);
+    float higherOrbit = max(
+        smoothstep(0.76, 1.46, windingOrder),
+        smoothstep(0.68, 1.55, state.photonResidency));
+    float trajectoryHigher = higherBend * lerp(0.42, 1.0, higherOrbit);
+    float higherOrder = max(step(1.5, discreteOrder), trajectoryHigher);
+
+    // Outer disk radii subtend the overly tall, broad transfer-function images.
+    // Their contribution falls naturally with emission radius, while the inner
+    // disk remains continuous all the way across the critical region.
+    float innerRadius = max(_DiskRadii.x, 0.001);
+    float radialRatio = saturate(innerRadius / max(diskRadius, innerRadius));
+    float secondaryRadialTransfer = pow(radialRatio, 2.35);
+    float higherRadialTransfer = pow(radialRatio, 3.00);
+
+    // Each additional plane passage and accumulated orbit loses flux
+    // exponentially. The first secondary passage is preserved; later orders and
+    // long-lived photon-orbit paths converge rapidly toward the critical curve.
+    float orderDecay = exp2(-0.72 * max(discreteOrder - 1.0, 0.0));
+    float windingDecay = exp2(-0.48 * max(windingOrder - 0.24, 0.0));
+    float pathDecay = orderDecay * windingDecay;
+
+    // Rays are traced away from the observer. The sign of their disk-normal motion
+    // identifies which optically thick disk face is seen. Returning passages are
+    // slightly more self-obscured, producing physical upper/lower asymmetry without
+    // referring to screen coordinates.
+    float positiveFaceToObserver = step(crossingOrientation, 0.0);
+    float faceVisibility = lerp(0.42, 1.0, positiveFaceToObserver);
+    float returningPassage = step(1.5, diskPassage);
+    float sequenceVisibility = lerp(
+        1.0,
+        lerp(0.64, 1.0, positiveFaceToObserver),
+        returningPassage);
+    float orientedTransfer = faceVisibility * sequenceVisibility;
+
+    float secondaryScale = min(_SecondaryImage.w, 0.65);
+    float higherScale = min(_DiskGeometry.z, 0.50);
+    float secondaryTransfer = secondaryScale * secondaryRadialTransfer *
+        pathDecay * orientedTransfer;
+    float higherTransfer = higherScale * higherRadialTransfer *
+        pathDecay * orientedTransfer;
+    return lerp(1.0, secondaryTransfer, saturate(secondaryOrder)) *
+        lerp(1.0, higherTransfer, saturate(higherOrder));
 }
 
 void SunkAccumulateDisk(
@@ -76,49 +146,105 @@ void SunkAccumulateDisk(
     float3 previousDirection,
     float3 nextDirection,
     float stepLength,
-    float2 screenPosition,
     float3 diskNormal)
 {
     float3 segment = nextPosition - previousPosition;
     float previousHeight = dot(previousPosition, diskNormal);
     float heightDelta = dot(segment, diskNormal);
-    float closestT = saturate(
-        -previousHeight * heightDelta /
-        max(heightDelta * heightDelta, 0.0000001));
-    float3 samplePosition = previousPosition + segment * closestT;
-    float height = dot(samplePosition, diskNormal);
-    float3 radialVector = samplePosition - diskNormal * height;
-    float diskRadius = length(radialVector);
+    float nextHeight = previousHeight + heightDelta;
+    float closestT = abs(heightDelta) > 0.00001
+        ? saturate(-previousHeight / heightDelta)
+        : 0.5;
+    float3 closestPosition = previousPosition + segment * closestT;
+    float closestHeight = dot(closestPosition, diskNormal);
+    float3 closestRadial = closestPosition - diskNormal * closestHeight;
+    float closestRadius = length(closestRadial);
     float innerRadius = _DiskRadii.x;
     float outerRadius = _DiskRadii.y;
     float halfThickness = max(_DiskRadii.z, 0.01);
-    float radial01 = saturate((diskRadius - innerRadius) / max(outerRadius - innerRadius, 0.001));
+    float radial01 = saturate((closestRadius - innerRadius) / max(outerRadius - innerRadius, 0.001));
     float flaredThickness = halfThickness * lerp(0.82, 1.38, radial01);
-    float density = SunkEvaluateDiskDensity(
-        samplePosition,
-        diskNormal,
-        innerRadius,
-        outerRadius,
-        halfThickness);
 
-    if (density <= 0.0005 || state.transmittance <= 0.002)
+    // Count actual equatorial-plane passages once, independently of the number of
+    // volume samples taken through the disk thickness. Crossings through the central
+    // cavity still advance the transfer-function order, provided they occur inside
+    // the disk's outer extent.
+    float previousSide = previousHeight >= 0.0 ? 1.0 : -1.0;
+    if (abs(state.diskSide) < 0.5)
+    {
+        state.diskSide = previousSide;
+    }
+
+    float nextSide = nextHeight >= 0.0 ? 1.0 : -1.0;
+    bool crossedPlane = state.diskSide * nextSide < 0.0;
+    float radialFeather = max(halfThickness * 1.35, 0.055);
+    bool orderedCrossing = crossedPlane &&
+        closestRadius <= outerRadius + radialFeather;
+    if (crossedPlane)
+    {
+        state.diskSide = nextSide;
+    }
+
+    if (orderedCrossing)
+    {
+        state.diskPlaneCrossings += 1.0;
+    }
+
+    // Samples immediately before a crossing belong to the upcoming passage. This
+    // keeps all volume samples from one physical traversal on the same image order.
+    bool approachingPlane = !crossedPlane &&
+        abs(nextHeight) < abs(previousHeight) &&
+        closestRadius <= outerRadius + radialFeather &&
+        abs(nextHeight) <= flaredThickness * 3.2;
+    float diskPassage = max(
+        state.diskPlaneCrossings + (approachingPlane ? 1.0 : 0.0),
+        1.0);
+
+    // Integrate a short window around the disk-plane closest approach. Composite
+    // Simpson sampling keeps a thin, curved disk continuous even when the closest
+    // approach falls between the regular ray steps.
+    float halfWindowT = abs(heightDelta) > 0.00001
+        ? min(1.0, flaredThickness * 2.8 / abs(heightDelta))
+        : 0.5;
+    float windowStart = max(0.0, closestT - halfWindowT);
+    float windowEnd = min(1.0, closestT + halfWindowT);
+    float windowSpan = windowEnd - windowStart;
+    if (windowSpan <= 0.0001 || state.transmittance <= 0.002)
     {
         return;
     }
 
-    float previousDensity = SunkEvaluateDiskDensity(
-        previousPosition,
-        diskNormal,
-        innerRadius,
-        outerRadius,
-        halfThickness);
-    float nextDensity = SunkEvaluateDiskDensity(
-        nextPosition,
-        diskNormal,
-        innerRadius,
-        outerRadius,
-        halfThickness);
-    float integratedDensity = (previousDensity + density * 4.0 + nextDensity) / 6.0;
+    float t0 = windowStart;
+    float t1 = lerp(windowStart, windowEnd, 0.25);
+    float t2 = lerp(windowStart, windowEnd, 0.50);
+    float t3 = lerp(windowStart, windowEnd, 0.75);
+    float t4 = windowEnd;
+    float3 p0 = previousPosition + segment * t0;
+    float3 p1 = previousPosition + segment * t1;
+    float3 p2 = previousPosition + segment * t2;
+    float3 p3 = previousPosition + segment * t3;
+    float3 p4 = previousPosition + segment * t4;
+    float d0 = SunkEvaluateDiskDensity(p0, diskNormal, innerRadius, outerRadius, halfThickness);
+    float d1 = SunkEvaluateDiskDensity(p1, diskNormal, innerRadius, outerRadius, halfThickness);
+    float d2 = SunkEvaluateDiskDensity(p2, diskNormal, innerRadius, outerRadius, halfThickness);
+    float d3 = SunkEvaluateDiskDensity(p3, diskNormal, innerRadius, outerRadius, halfThickness);
+    float d4 = SunkEvaluateDiskDensity(p4, diskNormal, innerRadius, outerRadius, halfThickness);
+    float weightedDensity = d0 + 4.0 * d1 + 2.0 * d2 + 4.0 * d3 + d4;
+    if (weightedDensity <= 0.0005)
+    {
+        return;
+    }
+
+    float3 samplePosition =
+        (p0 * d0 + p1 * (4.0 * d1) + p2 * (2.0 * d2) +
+         p3 * (4.0 * d3) + p4 * d4) /
+        max(weightedDensity, 0.000001);
+    float height = dot(samplePosition, diskNormal);
+    float3 radialVector = samplePosition - diskNormal * height;
+    float diskRadius = length(radialVector);
+    radial01 = saturate((diskRadius - innerRadius) / max(outerRadius - innerRadius, 0.001));
+    flaredThickness = halfThickness * lerp(0.82, 1.38, radial01);
+    float integratedDensity = windowSpan * weightedDensity / 12.0;
     float opticalDepth = integratedDensity * stepLength *
         max(_DiskGeometry.y, 0.0) / max(flaredThickness * 2.0, 0.025);
     float alpha = saturate(SunkBeerLambert(opticalDepth));
@@ -157,25 +283,12 @@ void SunkAccumulateDisk(
         _Relativity.x,
         _Relativity.y);
 
-    float projectionScale = _ScreenShadowRadius / max(_ApparentShadowRadius, 0.001);
-    float projectedMainExtent = (
-        outerRadius * abs(cos(_DiskGeometry.x)) +
-        halfThickness * 1.8) * projectionScale;
-    float separatedImage = smoothstep(
-        projectedMainExtent * 0.78,
-        projectedMainExtent * 1.38 + 0.004,
-        abs(screenPosition.y));
-    float windingOrder = state.orbitalWinding / SUNK_PI;
-    float lensedOrder = max(smoothstep(0.38, 0.95, state.totalTurn), separatedImage);
-    lensedOrder = max(lensedOrder, smoothstep(0.30, 0.72, windingOrder));
-    float higherOrder = max(
-        smoothstep(1.05, 2.10, state.totalTurn),
-        smoothstep(0.78, 1.42, windingOrder));
-    float compressedScale = min(_SecondaryImage.w, 0.65) *
-        SunkHigherOrderEnvelope(screenPosition, projectedMainExtent);
-    compressedScale *= lerp(1.0, min(_DiskGeometry.z, 0.50), higherOrder);
-
-    alpha *= lerp(1.0, compressedScale, lensedOrder);
+    float crossingOrientation = dot(tracedDirection, diskNormal);
+    alpha *= SunkDiskOrderAttenuation(
+        state,
+        diskPassage,
+        diskRadius,
+        crossingOrientation);
     state.diskRadiance += state.transmittance * emission * alpha;
     state.transmittance *= 1.0 - alpha;
 }
@@ -198,6 +311,8 @@ SunkRayTrace SunkTraceKerr(float2 screenPosition)
     state.totalTurn = 0.0;
     state.orbitalWinding = 0.0;
     state.photonResidency = 0.0;
+    state.diskPlaneCrossings = 0.0;
+    state.diskSide = 0.0;
     state.captured = 0.0;
     state.escaped = 0.0;
     state.sourceCoordinate = impact;
@@ -237,30 +352,34 @@ SunkRayTrace SunkTraceKerr(float2 screenPosition)
             break;
         }
 
-        float inverseRadius = rsqrt(radiusSquared);
-        float inverseRadiusCubed = inverseRadius / radiusSquared;
-        float inverseRadiusFifth = inverseRadiusCubed / radiusSquared;
-        float3 angularMomentum = cross(previousPosition, previousDirection);
-        float angularMomentumSquared = dot(angularMomentum, angularMomentum);
-        float3 schwarzschildAcceleration =
-            -1.5 * horizonRadius * massScale * angularMomentumSquared *
-            previousPosition * inverseRadiusFifth * lensingScale;
-
-        float3 radialDirection = previousPosition * inverseRadius;
-        float3 gravitomagneticField =
-            (3.0 * radialDirection * dot(radialDirection, spinAxis) - spinAxis) *
-            inverseRadiusCubed;
-        float3 frameDraggingAcceleration =
-            0.30 * _Spin * horizonRadius * horizonRadius *
-            cross(previousDirection, gravitomagneticField) * lensingScale;
-        float3 acceleration = schwarzschildAcceleration + frameDraggingAcceleration;
-        acceleration -= previousDirection * dot(acceleration, previousDirection);
+        float3 acceleration = SunkRayAcceleration(
+            previousPosition,
+            previousDirection,
+            spinAxis,
+            horizonRadius,
+            massScale,
+            lensingScale);
 
         float accelerationMagnitude = length(acceleration);
         float distanceStep = minimumStep + 0.14 * max(radius - horizonRadius, 0.0);
         float turningStep = maximumTurn / max(accelerationMagnitude, 0.0001);
         float stepLength = clamp(min(distanceStep, turningStep), minimumStep, maximumStep);
-        float3 turn = acceleration * stepLength;
+        float photonProximity = SunkGaussian(
+            radius - 1.5 * horizonRadius,
+            horizonRadius * 0.42);
+        stepLength = max(minimumStep, lerp(stepLength, stepLength * 0.52, photonProximity));
+
+        float3 midpointDirection = SunkSafeNormalize(
+            previousDirection + acceleration * (stepLength * 0.5));
+        float3 midpointPosition = previousPosition + midpointDirection * (stepLength * 0.5);
+        float3 midpointAcceleration = SunkRayAcceleration(
+            midpointPosition,
+            midpointDirection,
+            spinAxis,
+            horizonRadius,
+            massScale,
+            lensingScale);
+        float3 turn = midpointAcceleration * stepLength;
         turn *= min(1.0, maximumTurn / max(length(turn), 0.00001));
 
         float3 nextDirection = SunkSafeNormalize(previousDirection + turn);
@@ -288,8 +407,13 @@ SunkRayTrace SunkTraceKerr(float2 screenPosition)
             1.0);
         float photonRadius = 1.5 * horizonRadius *
             (1.0 - 0.10 * _Spin * spinOrientation);
+        float radialAlignment = abs(dot(
+            previousDirection,
+            previousPosition / max(radius, 0.0001)));
+        float orbitalTangency = smoothstep(0.18, 0.82, 1.0 - radialAlignment);
         state.photonResidency +=
             SunkGaussian(radius - photonRadius, horizonRadius * 0.18) *
+            lerp(0.24, 1.0, orbitalTangency) *
             stepLength / horizonRadius;
 
         SunkAccumulateDisk(
@@ -299,7 +423,6 @@ SunkRayTrace SunkTraceKerr(float2 screenPosition)
             previousDirection,
             nextDirection,
             stepLength,
-            screenPosition,
             spinAxis);
 
         state.position = nextPosition;
