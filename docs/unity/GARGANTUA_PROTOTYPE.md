@@ -24,10 +24,12 @@ The prototype includes:
 - an apparent black-hole shadow without sphere geometry;
 - a narrow photon ring tied to the shadow boundary;
 - one thin procedural accretion disk with a radial temperature gradient;
-- compressed upper and lower images derived from that same disk;
+- continuous accretion-disk density integration with Beer-Lambert compositing;
+- compressed upper and lower higher-order images derived from that same integrated disk;
 - Doppler brightening and color asymmetry;
 - approximate gravitational redshift;
-- Kerr-like screen-space distortion and a lensed procedural star field;
+- Kerr-inspired finite-step ray bending, frame dragging, and a lensed procedural star field;
+- multiple narrow photon-ring layers informed by ray turning and photon-sphere residency;
 - restrained bloom through the existing scene volume profile.
 
 The upper disk structure is deliberately treated as a secondary lensed image, not a
@@ -46,11 +48,46 @@ SecondaryImageThickness <= 0.15 apparent shadow radii
 SecondaryImageIntensity <= 0.65
 ```
 
-The reviewed defaults are intentionally tighter: `1.08` height, `0.045` half
+The reviewed defaults are intentionally tighter: `1.08` height, `0.040` half
 thickness, `1.72` horizontal half-span, and `0.28` intensity. The lower image is
 further compressed and dimmed so the two lensed images do not read as a second
 symmetrical disk.
 
-The current lensing is a stable analytic approximation intended to establish the
-composition and art direction. Numerical Kerr ray integration and measured quality
-tiers remain later milestones.
+## Numerical model and limits
+
+The current renderer traces 96 finite steps per pixel by default (configurable from 24
+to 128), with adaptive step length and a capped direction change. It combines a Schwarzschild-inspired bending
+term with a real-time frame-dragging approximation, records capture, escape, accumulated
+turn, orbital winding, and photon-sphere residency, and samples the disk along every ray
+segment using a Simpson density estimate.
+
+This model is intentionally described as **Kerr-inspired finite-step integration**. It is
+not an exact integration of the Kerr metric in Boyer-Lindquist coordinates and is not
+suitable for scientific measurement. The screen-space higher-order-image envelope remains
+as an art-direction safety bound so the upper image cannot grow into a second large disk.
+
+## Windows graphics backends
+
+Windows Standalone is configured in this order:
+
+1. Direct3D 12 (default)
+2. Vulkan
+3. Direct3D 11 (compatibility fallback)
+
+The milestone is validated on both Direct3D 12 and native NVIDIA Vulkan. Their 1600x900
+Player captures are visually equivalent; the renderer does not depend on a backend-specific
+UV orientation or screen flip.
+
+Current Windows builds can log that URP's internal `DBufferClear` shader is unsupported.
+URP strips the unused DBuffer variants while its global resource table still references
+the shader. This project has no Decal renderer feature, and the Sunk pass writes only the
+active color target, so the warning does not affect the current image on either backend.
+
+## Reference boundary
+
+The implementation was independently authored after reviewing the public concepts and
+visual behavior in [Reach036/BlackHole_Urp](https://github.com/Reach036/BlackHole_Urp),
+[rossning92/Blackhole](https://github.com/rossning92/Blackhole),
+[the supplied Zhihu article](https://zhuanlan.zhihu.com/p/20536269771), and
+[the supplied ShaderToy scene](https://www.shadertoy.com/view/4XcfR2). No source code or
+assets from `rossning92/Blackhole`, which does not declare a repository license, are included.

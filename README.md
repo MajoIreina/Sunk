@@ -9,13 +9,16 @@ implementation on `main`; it is not a mixed Rust/Unity workspace.
 - Phase 1 Gargantua visual prototype
 - Unity `6000.0.30f1` (Unity 6 LTS)
 - Universal Render Pipeline `17.0.1`
+- Windows graphics API order: Direct3D 12, Vulkan, then Direct3D 11 fallback
 - Windows IL2CPP module installed locally
 - Product renderer, prototype scene, parameter asset, and EditMode tests are implemented
 - Native window integration and file operations are not implemented yet
 
 The first visual milestone now includes a full-screen mathematical Gargantua renderer: black-hole
-shadow, photon ring, compact accretion disk and lensed secondary image, Kerr-inspired lensing,
-Doppler beaming, redshift, and a procedural star field. See
+shadow, layered photon rings, a compact accretion disk sampled continuously along the ray,
+compressed higher-order disk images, Kerr-inspired finite-step ray integration, Doppler beaming,
+redshift, and a procedural star field. The renderer is a real-time visual approximation, not a
+scientifically exact Kerr geodesic solver. See
 [the prototype guide](docs/unity/GARGANTUA_PROTOTYPE.md).
 
 ## Worktree isolation

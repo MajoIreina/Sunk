@@ -3,6 +3,7 @@ using NUnit.Framework;
 using Sunk.Rendering.Gargantua;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
 namespace Sunk.Tests.Rendering.Gargantua
@@ -52,6 +53,21 @@ namespace Sunk.Tests.Rendering.Gargantua
             Assert.That(
                 AssetDatabase.GetAssetPath(rendererList.GetArrayElementAtIndex(0).objectReferenceValue),
                 Is.EqualTo(RendererPath));
+        }
+
+        [Test]
+        public void WindowsPlayerPrefersModernGraphicsApis()
+        {
+            BuildTarget windowsTarget = BuildTarget.StandaloneWindows64;
+            Assert.That(PlayerSettings.GetUseDefaultGraphicsAPIs(windowsTarget), Is.False);
+            Assert.That(
+                PlayerSettings.GetGraphicsAPIs(windowsTarget),
+                Is.EqualTo(new[]
+                {
+                    GraphicsDeviceType.Direct3D12,
+                    GraphicsDeviceType.Vulkan,
+                    GraphicsDeviceType.Direct3D11
+                }));
         }
     }
 }

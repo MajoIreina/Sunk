@@ -43,4 +43,14 @@ float SunkGaussian(float value, float width)
     return exp2(-normalized * normalized * 1.442695);
 }
 
+float3 SunkSafeNormalize(float3 value)
+{
+    return value * rsqrt(max(dot(value, value), 0.0000001));
+}
+
+float SunkBeerLambert(float opticalDepth)
+{
+    return 1.0 - exp2(-max(opticalDepth, 0.0) * 1.442695);
+}
+
 #endif

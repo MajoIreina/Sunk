@@ -13,6 +13,8 @@ namespace Sunk.Rendering.Gargantua
         private static readonly int DiskRadii = Shader.PropertyToID("_DiskRadii");
         private static readonly int DiskAppearance = Shader.PropertyToID("_DiskAppearance");
         private static readonly int Relativity = Shader.PropertyToID("_Relativity");
+        private static readonly int Integration = Shader.PropertyToID("_Integration");
+        private static readonly int DiskGeometry = Shader.PropertyToID("_DiskGeometry");
         private static readonly int SecondaryImage = Shader.PropertyToID("_SecondaryImage");
         private static readonly int Environment = Shader.PropertyToID("_Environment");
 
@@ -38,6 +40,16 @@ namespace Sunk.Rendering.Gargantua
                 settings.DopplerStrength,
                 settings.RedshiftStrength,
                 settings.PhotonRingWidth,
+                0.0f));
+            material.SetVector(Integration, new Vector4(
+                settings.RaySteps,
+                settings.MinStep,
+                settings.MaxStep,
+                settings.MaxTurn));
+            material.SetVector(DiskGeometry, new Vector4(
+                settings.DiskInclination * Mathf.Deg2Rad,
+                settings.DiskOpacity,
+                settings.HigherOrderIntensity,
                 0.0f));
             material.SetVector(SecondaryImage, new Vector4(
                 settings.SecondaryImageHeight,

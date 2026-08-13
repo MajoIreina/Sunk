@@ -20,17 +20,24 @@ MonoBehaviour:
   lensingStrength: 0.86
   diskInnerRadius: 3.2
   diskOuterRadius: 10.4
-  diskHalfThickness: 0.08
+  diskHalfThickness: 0.06
   diskTemperature: 9200
   diskEmission: 1.15
   turbulence: 0.55
   rotationSpeed: 0.08
-  dopplerStrength: 0.82
+  dopplerStrength: 0.76
   redshiftStrength: 0.72
   photonRingIntensity: 0.46
-  photonRingWidth: 0.009
+  photonRingWidth: 0.007
+  raySteps: 96
+  minStep: 0.035
+  maxStep: 0.48
+  maxTurn: 0.085
+  diskInclination: 87
+  diskOpacity: 0.72
+  higherOrderIntensity: 0.22
   secondaryImageHeight: 1.08
-  secondaryImageThickness: 0.045
+  secondaryImageThickness: 0.04
   secondaryImageSpan: 1.72
   secondaryImageIntensity: 0.28
   starDensity: 0.28

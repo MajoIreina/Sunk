@@ -3,6 +3,7 @@ using System.Linq;
 using Sunk.Rendering.Gargantua;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
 namespace Sunk.Editor.Gargantua
@@ -39,6 +40,7 @@ namespace Sunk.Editor.Gargantua
             EnsureFolder("Assets/Sunk/Scenes");
 
             GargantuaSettings settings = LoadOrCreateSettings();
+            ConfigureWindowsGraphicsApis();
             Shader shader = AssetDatabase.LoadAssetAtPath<Shader>(ShaderPath);
             if (shader == null)
             {
@@ -92,6 +94,28 @@ namespace Sunk.Editor.Gargantua
             AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
 
             Debug.Log("Sunk Gargantua prototype setup completed.");
+        }
+
+        private static void ConfigureWindowsGraphicsApis()
+        {
+            BuildTarget windowsTarget = BuildTarget.StandaloneWindows64;
+            GraphicsDeviceType[] expectedApis =
+            {
+                GraphicsDeviceType.Direct3D12,
+                GraphicsDeviceType.Vulkan,
+                GraphicsDeviceType.Direct3D11
+            };
+
+            if (PlayerSettings.GetUseDefaultGraphicsAPIs(windowsTarget))
+            {
+                PlayerSettings.SetUseDefaultGraphicsAPIs(windowsTarget, false);
+            }
+
+            GraphicsDeviceType[] configuredApis = PlayerSettings.GetGraphicsAPIs(windowsTarget);
+            if (!configuredApis.SequenceEqual(expectedApis))
+            {
+                PlayerSettings.SetGraphicsAPIs(windowsTarget, expectedApis);
+            }
         }
 
         private static GargantuaSettings LoadOrCreateSettings()
