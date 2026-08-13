@@ -1,0 +1,37 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e9cc34652300c2046a93744c9335cb25, type: 3}
+  m_Name: GargantuaSettings
+  m_EditorClassIdentifier: 
+  mass: 1
+  spin: 0.92
+  horizonRadius: 1
+  apparentShadowRadius: 2.6
+  screenShadowRadius: 0.37
+  lensingStrength: 0.86
+  diskInnerRadius: 3.2
+  diskOuterRadius: 10.4
+  diskHalfThickness: 0.08
+  diskTemperature: 9200
+  diskEmission: 1.15
+  turbulence: 0.55
+  rotationSpeed: 0.08
+  dopplerStrength: 0.82
+  redshiftStrength: 0.72
+  photonRingIntensity: 0.46
+  photonRingWidth: 0.009
+  secondaryImageHeight: 1.08
+  secondaryImageThickness: 0.045
+  secondaryImageSpan: 1.72
+  secondaryImageIntensity: 0.28
+  starDensity: 0.28
+  vignette: 0.32

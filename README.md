@@ -6,15 +6,17 @@ implementation on `main`; it is not a mixed Rust/Unity workspace.
 
 ## Status
 
-- Phase 0 Unity foundation
+- Phase 1 Gargantua visual prototype
 - Unity `6000.0.30f1` (Unity 6 LTS)
 - Universal Render Pipeline `17.0.1`
 - Windows IL2CPP module installed locally
-- Product code, native window integration, and file operations are not implemented yet
+- Product renderer, prototype scene, parameter asset, and EditMode tests are implemented
+- Native window integration and file operations are not implemented yet
 
-The checked-in scene and rendering settings come from the matching Unity 6 URP template. The first
-development milestone is the Gargantua renderer: event horizon, photon ring, compact accretion disk,
-Kerr-inspired lensing, Doppler beaming, and adaptive quality.
+The first visual milestone now includes a full-screen mathematical Gargantua renderer: black-hole
+shadow, photon ring, compact accretion disk and lensed secondary image, Kerr-inspired lensing,
+Doppler beaming, redshift, and a procedural star field. See
+[the prototype guide](docs/unity/GARGANTUA_PROTOTYPE.md).
 
 ## Worktree isolation
 
@@ -39,8 +41,9 @@ two implementations.
 ## Develop
 
 1. In Unity Hub, add and open `unity/Sunk`.
-2. Keep all product-owned assets under `Assets/Sunk` as that structure is introduced.
-3. Run the repository layout check before committing:
+2. Open `Assets/Sunk/Scenes/GargantuaPrototype.unity`.
+3. Keep all product-owned assets under `Assets/Sunk`.
+4. Run the repository layout check before committing:
 
 ```powershell
 pwsh -NoProfile -File tools/check-unity-layout.ps1
@@ -58,7 +61,7 @@ After Unity Personal is activated, verify the project headlessly:
 
 ```text
 unity/Sunk/                  Unity Hub project root
-  Assets/                    scenes, settings, and future Assets/Sunk product code
+  Assets/Sunk/               product runtime, shaders, scenes, settings, and tests
   Packages/                  pinned Unity package manifest and lock file
   ProjectSettings/           versioned Unity project settings
 docs/unity/                  Unity implementation specification
