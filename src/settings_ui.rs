@@ -24,6 +24,119 @@ pub const SETTINGS_WINDOW_TITLE: &str = "Sunk 设置";
 
 pub struct SettingsUiPlugin;
 
+#[derive(Message, Debug, Clone, Copy)]
+pub(crate) struct ShowSettingsWindow;
+
+#[derive(Debug, Clone)]
+pub(crate) struct UninstallPrompt {
+    pub request_id: u64,
+    pub application_name: String,
+    pub publisher: Option<String>,
+    pub install_location: Option<PathBuf>,
+    pub source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UninstallDecision {
+    Confirm(u64),
+    Cancel(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileActionStatusKind {
+    Information,
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FileActionStatus {
+    pub kind: FileActionStatusKind,
+    pub title: String,
+    pub detail: String,
+}
+
+#[derive(Resource, Debug, Default)]
+pub(crate) struct FileActionUiState {
+    prompt: Option<UninstallPrompt>,
+    decision: Option<UninstallDecision>,
+    status: Option<FileActionStatus>,
+    focus_cancel: bool,
+}
+
+impl FileActionUiState {
+    pub(crate) fn request_uninstall(&mut self, prompt: UninstallPrompt) {
+        self.prompt = Some(prompt);
+        self.decision = None;
+        self.focus_cancel = true;
+    }
+
+    pub(crate) fn take_decision(&mut self) -> Option<UninstallDecision> {
+        self.decision.take()
+    }
+
+    fn cancel_pending_uninstall(&mut self) -> Option<u64> {
+        let request_id = self.prompt.take()?.request_id;
+        self.decision = Some(UninstallDecision::Cancel(request_id));
+        self.focus_cancel = true;
+        Some(request_id)
+    }
+
+    fn resolve_prompt(&mut self, decision: UninstallDecision) {
+        let request_id = match decision {
+            UninstallDecision::Confirm(request_id) | UninstallDecision::Cancel(request_id) => {
+                request_id
+            }
+        };
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.request_id == request_id)
+        {
+            self.prompt = None;
+            self.decision = Some(decision);
+            self.focus_cancel = true;
+        }
+    }
+
+    pub(crate) fn dismiss_prompt(&mut self, request_id: u64) {
+        let prompt_matches = self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.request_id == request_id);
+        let decision_matches = self.decision.is_some_and(|decision| {
+            matches!(
+                decision,
+                UninstallDecision::Confirm(id) | UninstallDecision::Cancel(id)
+                    if id == request_id
+            )
+        });
+        if prompt_matches {
+            self.prompt = None;
+        }
+        if decision_matches {
+            self.decision = None;
+        }
+        if prompt_matches || decision_matches {
+            self.focus_cancel = true;
+        }
+    }
+
+    pub(crate) fn set_status(
+        &mut self,
+        kind: FileActionStatusKind,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.status = Some(FileActionStatus {
+            kind,
+            title: title.into(),
+            detail: detail.into(),
+        });
+    }
+}
+
 impl Plugin for SettingsUiPlugin {
     fn build(&self, app: &mut App) {
         assert!(
@@ -43,12 +156,15 @@ impl Plugin for SettingsUiPlugin {
         app.init_resource::<BlackHoleSettings>()
             .init_resource::<PendingSettingsFocus>()
             .init_resource::<ChineseFontState>()
+            .init_resource::<FileActionUiState>()
+            .add_message::<ShowSettingsWindow>()
             .add_systems(Startup, spawn_settings_window)
             .add_systems(
                 Update,
                 (
                     apply_pending_focus,
                     toggle_settings_window,
+                    show_requested_settings_window,
                     hide_settings_on_close,
                     exit_on_primary_close,
                     sync_primary_camera_anti_aliasing,
@@ -235,6 +351,7 @@ fn apply_pending_focus(
 fn toggle_settings_window(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut pending: ResMut<PendingSettingsFocus>,
+    mut file_actions: ResMut<FileActionUiState>,
     mut windows: Query<&mut Window, With<SettingsWindow>>,
 ) {
     let Ok(mut window) = windows.single_mut() else {
@@ -243,19 +360,47 @@ fn toggle_settings_window(
 
     if keyboard.just_pressed(KeyCode::F1) {
         if window.visible {
-            window.visible = false;
-            window.focused = false;
-            pending.0 = false;
+            hide_settings_window(&mut window, &mut pending, &mut file_actions);
         } else {
+            file_actions.cancel_pending_uninstall();
             window.set_minimized(false);
             window.visible = true;
             pending.0 = true;
         }
     } else if window.focused && keyboard.just_pressed(KeyCode::Escape) {
-        window.visible = false;
-        window.focused = false;
-        pending.0 = false;
+        hide_settings_window(&mut window, &mut pending, &mut file_actions);
     }
+}
+
+fn hide_settings_window(
+    window: &mut Window,
+    pending: &mut PendingSettingsFocus,
+    file_actions: &mut FileActionUiState,
+) {
+    file_actions.cancel_pending_uninstall();
+    window.set_minimized(false);
+    window.visible = false;
+    window.focused = false;
+    pending.0 = false;
+}
+
+fn show_requested_settings_window(
+    mut requests: MessageReader<ShowSettingsWindow>,
+    mut pending: ResMut<PendingSettingsFocus>,
+    mut windows: Query<&mut Window, With<SettingsWindow>>,
+) {
+    if requests.read().next().is_none() {
+        return;
+    }
+
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    window.set_minimized(false);
+    window.visible = true;
+    // `apply_pending_focus` already ran this frame. The next frame focuses the
+    // now-visible native HWND after winit has applied the visibility change.
+    pending.0 = true;
 }
 
 /// `WindowPlugin::close_when_requested` must be disabled by the app so Bevy's
@@ -263,6 +408,7 @@ fn toggle_settings_window(
 fn hide_settings_on_close(
     mut close_requests: MessageReader<WindowCloseRequested>,
     mut pending: ResMut<PendingSettingsFocus>,
+    mut file_actions: ResMut<FileActionUiState>,
     mut windows: Query<(Entity, &mut Window), With<SettingsWindow>>,
 ) {
     let Ok((entity, mut window)) = windows.single_mut() else {
@@ -270,10 +416,7 @@ fn hide_settings_on_close(
     };
 
     if close_requests.read().any(|event| event.window == entity) {
-        window.set_minimized(false);
-        window.visible = false;
-        window.focused = false;
-        pending.0 = false;
+        hide_settings_window(&mut window, &mut pending, &mut file_actions);
     }
 }
 
@@ -319,6 +462,7 @@ fn settings_panel(
     mut context: Single<&mut EguiContext, With<SettingsEguiContext>>,
     mut settings: ResMut<BlackHoleSettings>,
     desktop_capture: Res<DesktopCaptureState>,
+    mut file_actions: ResMut<FileActionUiState>,
     mut selected_tab: Local<SettingsTab>,
     mut chinese_font: ResMut<ChineseFontState>,
 ) {
@@ -356,7 +500,9 @@ fn settings_panel(
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             match *selected_tab {
-                SettingsTab::General => general_tab(ui, &mut settings),
+                SettingsTab::General => {
+                    general_tab(ui, &mut settings, file_actions.status.as_ref())
+                }
                 SettingsTab::Display => display_tab(ui, &mut settings, &desktop_capture),
                 SettingsTab::Quality => quality_tab(ui, &mut settings),
                 SettingsTab::About => about_tab(ui),
@@ -374,10 +520,16 @@ fn settings_panel(
         });
     });
 
+    uninstall_confirmation_modal(context, &mut file_actions);
+
     settings.sanitize();
 }
 
-fn general_tab(ui: &mut egui::Ui, settings: &mut BlackHoleSettings) {
+fn general_tab(
+    ui: &mut egui::Ui,
+    settings: &mut BlackHoleSettings,
+    file_action_status: Option<&FileActionStatus>,
+) {
     section_heading(ui, "黑洞行为");
     described_slider(
         ui,
@@ -398,6 +550,85 @@ fn general_tab(ui: &mut egui::Ui, settings: &mut BlackHoleSettings) {
     ui.label("空格：暂停或继续动画");
     ui.label("R：恢复默认参数");
     ui.label("F1：显示或隐藏设置窗口");
+
+    section_heading(ui, "文件交互状态");
+    if let Some(status) = file_action_status {
+        let color = match status.kind {
+            FileActionStatusKind::Information => egui::Color32::from_rgb(135, 185, 235),
+            FileActionStatusKind::Success => egui::Color32::from_rgb(120, 205, 160),
+            FileActionStatusKind::Warning => egui::Color32::from_rgb(225, 185, 105),
+            FileActionStatusKind::Error => egui::Color32::from_rgb(235, 115, 115),
+        };
+        ui.label(egui::RichText::new(&status.title).strong().color(color));
+        setting_description(ui, &status.detail);
+    } else {
+        setting_description(ui, "尚未处理文件或软件图标。拖入目标后，结果会显示在这里。");
+    }
+}
+
+fn uninstall_confirmation_modal(context: &egui::Context, state: &mut FileActionUiState) {
+    let Some(prompt) = state.prompt.clone() else {
+        return;
+    };
+
+    let mut decision = None;
+    let response = egui::Modal::new(egui::Id::new("sunk-uninstall-confirmation")).show(
+        context,
+        |ui| {
+            ui.set_max_width(440.0);
+            ui.heading("确认卸载软件");
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(&prompt.application_name).strong());
+            if let Some(publisher) = prompt
+                .publisher
+                .as_deref()
+                .filter(|publisher| !publisher.trim().is_empty())
+            {
+                ui.label(format!("发布者（注册信息，未验证）：{publisher}"));
+            } else {
+                ui.label("发布者（未验证）：未提供");
+            }
+            if let Some(location) = &prompt.install_location {
+                ui.add(
+                    egui::Label::new(format!("安装位置：{}", location.display())).wrap(),
+                );
+            }
+            ui.add(
+                egui::Label::new(format!("拖入来源：{}", prompt.source_path.display())).wrap(),
+            );
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "确认后将启动该软件在 Windows 中登记的卸载程序。Sunk 不会删除程序目录；后续步骤可能触发系统权限确认。",
+                    )
+                    .color(egui::Color32::from_rgb(225, 185, 105)),
+                )
+                .wrap(),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let cancel = ui.button("取消");
+                if state.focus_cancel {
+                    cancel.request_focus();
+                    state.focus_cancel = false;
+                }
+                if cancel.clicked() {
+                    decision = Some(UninstallDecision::Cancel(prompt.request_id));
+                }
+                if ui.button("确认并启动卸载").clicked() {
+                    decision = Some(UninstallDecision::Confirm(prompt.request_id));
+                }
+            });
+        },
+    );
+
+    if decision.is_none() && response.should_close() {
+        decision = Some(UninstallDecision::Cancel(prompt.request_id));
+    }
+    if let Some(decision) = decision {
+        state.resolve_prompt(decision);
+    }
 }
 
 fn display_tab(
@@ -652,6 +883,16 @@ fn chinese_font_candidates() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    fn uninstall_prompt(request_id: u64) -> UninstallPrompt {
+        UninstallPrompt {
+            request_id,
+            application_name: "Example".to_owned(),
+            publisher: None,
+            install_location: None,
+            source_path: PathBuf::from(r"C:\Desktop\Example.lnk"),
+        }
+    }
+
     #[test]
     fn settings_window_uses_desired_size_when_it_fits() {
         assert_eq!(
@@ -665,6 +906,55 @@ mod tests {
         let size = settings_window_logical_size(UVec2::new(1_920, 1_040), 2.0);
         assert_eq!(size, UVec2::new(520, 472));
         assert!(size.y * 2 + 96 <= 1_040);
+    }
+
+    #[test]
+    fn hiding_settings_cancels_the_prompt_and_restores_cancel_focus() {
+        let mut window = Window {
+            visible: true,
+            focused: true,
+            ..default()
+        };
+        let mut pending = PendingSettingsFocus(true);
+        let mut state = FileActionUiState::default();
+        state.request_uninstall(uninstall_prompt(42));
+        state.focus_cancel = false;
+
+        hide_settings_window(&mut window, &mut pending, &mut state);
+
+        assert!(!window.visible);
+        assert!(!window.focused);
+        assert!(!pending.0);
+        assert!(state.prompt.is_none());
+        assert_eq!(state.take_decision(), Some(UninstallDecision::Cancel(42)));
+        assert!(state.focus_cancel);
+    }
+
+    #[test]
+    fn resolving_a_stale_prompt_does_not_replace_the_current_request() {
+        let mut state = FileActionUiState::default();
+        state.request_uninstall(uninstall_prompt(42));
+
+        state.resolve_prompt(UninstallDecision::Confirm(41));
+
+        assert_eq!(
+            state.prompt.as_ref().map(|prompt| prompt.request_id),
+            Some(42)
+        );
+        assert_eq!(state.take_decision(), None);
+    }
+
+    #[test]
+    fn dismissing_a_resolved_prompt_clears_its_pending_decision() {
+        let mut state = FileActionUiState::default();
+        state.request_uninstall(uninstall_prompt(42));
+        state.resolve_prompt(UninstallDecision::Confirm(42));
+
+        state.dismiss_prompt(42);
+
+        assert!(state.prompt.is_none());
+        assert_eq!(state.take_decision(), None);
+        assert!(state.focus_cancel);
     }
 }
 

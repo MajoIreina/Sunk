@@ -27,13 +27,25 @@ Primary-window controls:
 - `F1`: hide or show settings
 - `Esc`: quit from the renderer, or hide the focused settings window
 
+## File and application drops
+
+The current Windows integration accepts filesystem drops from Explorer and the desktop through the native `CF_HDROP` path. A drop is accepted only when the pointer is still inside the black-hole target at release; receiving an event for the transparent window is not sufficient authorization. Paths from one frame are kept in first-seen order, exact duplicates are removed, and a batch above 256 unique paths is rejected as a whole. After canonicalization, case-insensitive duplicates and parent/child overlaps are also rejected before any operation begins.
+
+Ordinary files and directories are moved only to the Windows Recycle Bin through a recycle-only `IFileOperation`. Sunk has no permanent-delete fallback. Drive roots, Windows and program-installation trees, paths that contain the running Sunk executable, reparse points and symbolic links, and UNC or other network paths are rejected before an operation is queued. Validation is repeated on the file-operation worker immediately before the move.
+
+Windows `.lnk` shortcuts and directly dropped `.exe` files enter the application-identification path rather than being deleted as ordinary files. Sunk resolves a classic shortcut and requires one high-confidence match in the current-user or local-machine, 32-bit or 64-bit Windows uninstall registry. A Chinese confirmation dialog shows the matched application, unverified registry publisher, installation location, and dropped source before the registered Win32 or MSI uninstaller can start. The command is parsed into an executable and arguments and is launched without `cmd.exe` or another shell. UWP/MSIX/AppRef and `.url`/`.website` links, unsafe commands, and missing or ambiguous matches are rejected; Sunk never guesses an application or deletes its installation directory.
+
+The interaction distinguishes hover, attraction/capture, orbit, event-horizon waiting, and real success or failure. An application visual pauses until the user confirms. A file operation begins only when its visual reaches the event horizon, then holds there until the worker returns a result; cancellation or failure produces a visible rejection instead of a false consume animation.
+
+winit's built-in Windows drop target currently reports `DROPEFFECT_COPY`, so Explorer shows the standard copy cursor even though Sunk performs its own validated Recycle Bin or uninstall action after release. Changing that system cursor requires a custom native `IDropTarget` and remains a known UX limitation. The implementation does not imply that the manual Explorer, Recycle Bin, or disposable-application checks in `docs/ROADMAP.md` have passed.
+
 ## Settings window
 
 The settings interface is Chinese and gives every editable option a short inline description as well as a hover explanation where useful. Its initial size is capped against the primary monitor work area and DPI; the scroll view keeps every control reachable on compact or high-scale displays. It is organized into four pages:
 
 | Page | Controls and status |
 | --- | --- |
-| **通用** | Black-hole apparent size, disk animation speed, and interaction summary |
+| **通用** | Black-hole apparent size, disk animation speed, interaction summary, and the latest file-operation status |
 | **显示** | Disk tint, physical temperature, optical depth, thickness, emission, corona, turbulence, cloud layering, desktop-warp strength, lens influence, exposure, and capture status |
 | **画质** | Geodesic integrator quality and an independent anti-aliasing selector |
 | **关于** | Version, renderer, material, and desktop-compositing information |
@@ -45,6 +57,8 @@ Changes apply live. **恢复默认设置** restores the complete render configur
 The transparent renderer window grows and shrinks with the apparent-size control. Its camera composition expands with the disk and lens-influence setting so the outer visible edge stays inside an 88% safe radius. Native resizing preserves the window center where possible and clamps the outer rectangle to the current monitor work area; if the requested maximum cannot fit, the effective black-hole size is reduced instead of clipping the render at the window or screen edge. The requested value is retained, so moving back to a larger monitor restores the intended size automatically.
 
 Hit testing follows the global Windows cursor even after the overlay becomes click-through. Only the central shadow/photon ring and the projected emitting-disk ellipse claim pointer input. Transparent corners and areas that contain only refracted desktop pixels pass clicks to dialogs and applications underneath. Hit testing stays locked only when a press originated on visible primary-window content, so dragging a settings control cannot make the transparent renderer claim the desktop. A queued resize remains click-through until the native client size is confirmed; `P` remains an explicit full-window passthrough override.
+
+An external OLE file drag has its own ownership state because its mouse press originates in Explorer, not in the Bevy window. While that drag is over the black-hole target, the hit region remains available and native resizing is deferred. Moving outside the actual target removes the hover response, and the release position is checked again before a batch is created. File events addressed to the settings window are ignored by the primary drop coordinator.
 
 ## Rendering model
 
@@ -93,7 +107,8 @@ The transparent renderer HWND uses `WDA_EXCLUDEFROMCAPTURE` to prevent recursive
 - Current spacetime: Schwarzschild, not Kerr. Rotation controls disk pattern motion; it does not claim frame dragging.
 - No synthetic star field or opaque rectangular background.
 - TAA and MSAA are deliberately unavailable for the technical reasons described above; SMAA is the default and SSAA 2x2 is the high-cost spatial option.
-- Run `cargo test` for characteristic radii, critical capture/escape rays, invariant drift, capture-coordinate mapping, and settings sanitization.
+- File and application operations are Windows-only in this iteration. Ordinary targets are Recycle Bin only; classic Win32/MSI uninstall requires an explicit Chinese confirmation.
+- Run `cargo test` for characteristic radii, critical capture/escape rays, invariant drift, capture-coordinate mapping, settings sanitization, drop batching, protected-path rejection, application matching, and uninstall command parsing.
 - Set `SUNK_CAPTURE_FRAME` to an absolute PNG path before launch for an internal framebuffer QA capture. `SUNK_CAPTURE_AFTER_DESKTOP_FRAME` optionally delays it until a chosen desktop-capture frame.
 
 This is an independent implementation of published physical equations. See `THIRD_PARTY_NOTICES.md` for research references and licensing notes.
@@ -103,6 +118,8 @@ This is an independent implementation of published physical equations. See `THIR
 - `docs/ARCHITECTURE.md` describes the current native renderer and desktop-compositing boundaries.
 - `docs/ROADMAP.md` records the remaining renderer, integration, and release work.
 - `Sunk_Desktop_Development_Document_v0.1.docx` is retained as the historical product baseline; where it differs from the running implementation, the current source and Markdown documentation take precedence.
+
+The rollback branch `backup/pre-file-operations-20260816` points to `8864a41`, the complete native renderer immediately before this file-operation iteration.
 
 The CI release gate limits `sunk.exe` to 128 MiB. The separately deployed DXC runtime pair is tracked as packaging work rather than being hidden inside that executable limit.
 

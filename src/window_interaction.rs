@@ -6,7 +6,10 @@ use bevy::{
     window::{CursorOptions, PrimaryWindow},
 };
 
-use crate::{black_hole::BlackHoleControls, settings::BlackHoleSettings};
+use crate::{
+    black_hole::BlackHoleControls, file_interaction::DropInteractionState,
+    settings::BlackHoleSettings,
+};
 
 const PRIMARY_WINDOW_TITLE: &str = "Sunk Black Hole";
 // `WindowResolution::new` defines the initial surface in physical pixels. Keep
@@ -134,8 +137,48 @@ fn pointer_button_flag(button: MouseButton) -> u8 {
     }
 }
 
+fn should_defer_window_resize(pointer_pressed: bool, file_drag_active: bool) -> bool {
+    pointer_pressed || file_drag_active
+}
+
+fn should_hit_test_overlay(pointer_locked: bool, cursor_hit: bool, file_drag_active: bool) -> bool {
+    pointer_locked || cursor_hit || file_drag_active
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PrimaryCursorSample {
+    pub(crate) position: Vec2,
+    pub(crate) client_size: Vec2,
+}
+
+fn logical_cursor_sample(
+    physical_position: Vec2,
+    physical_client_size: Vec2,
+    scale_factor: f32,
+) -> Option<PrimaryCursorSample> {
+    let scale = scale_factor;
+    if !physical_position.is_finite()
+        || !physical_client_size.is_finite()
+        || !scale.is_finite()
+        || scale <= 0.0
+        || physical_client_size.x <= 1.0
+        || physical_client_size.y <= 1.0
+        || physical_position.x < 0.0
+        || physical_position.y < 0.0
+        || physical_position.x >= physical_client_size.x
+        || physical_position.y >= physical_client_size.y
+    {
+        return None;
+    }
+
+    Some(PrimaryCursorSample {
+        position: physical_position / scale,
+        client_size: physical_client_size / scale,
+    })
+}
+
 #[derive(Resource, Debug)]
-struct OverlayWindowRuntime {
+pub(crate) struct OverlayWindowRuntime {
     native_handle: usize,
     last_resize_at: f64,
     last_reported_limit: Option<f32>,
@@ -195,6 +238,39 @@ impl Default for OverlayWindowRuntime {
     }
 }
 
+/// Samples the current native cursor position instead of Bevy's `CursorMoved`
+/// cache. Windows OLE drag-over and drop callbacks do not update that cache.
+pub(crate) fn primary_cursor_sample(
+    window: &Window,
+    runtime: &mut OverlayWindowRuntime,
+) -> Option<PrimaryCursorSample> {
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = windows_backend::owned_primary_hwnd(runtime)?;
+        let (physical_position, physical_client_size) = windows_backend::cursor_in_client(hwnd)?;
+        logical_cursor_sample(
+            physical_position,
+            physical_client_size,
+            window.scale_factor(),
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = runtime;
+        let position = window.cursor_position()?;
+        let client_size = Vec2::new(window.width(), window.height());
+        (position.x >= 0.0
+            && position.y >= 0.0
+            && position.x < client_size.x
+            && position.y < client_size.y)
+            .then_some(PrimaryCursorSample {
+                position,
+                client_size,
+            })
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod windows_backend {
     use std::{ffi::c_void, mem::size_of};
@@ -220,13 +296,10 @@ mod windows_backend {
         time: Res<Time>,
         settings: Res<BlackHoleSettings>,
         mouse_buttons: Res<ButtonInput<MouseButton>>,
+        file_drag: Res<DropInteractionState>,
         mut window: Single<&mut Window, With<PrimaryWindow>>,
         mut runtime: ResMut<OverlayWindowRuntime>,
     ) {
-        if mouse_buttons.any_pressed([MouseButton::Left, MouseButton::Right]) {
-            return;
-        }
-
         let Some(hwnd) = owned_primary_hwnd(&mut runtime) else {
             return;
         };
@@ -273,6 +346,16 @@ mod windows_backend {
             return;
         }
 
+        // A previously queued native resize is still allowed to settle and clear
+        // `resize_pending`, but no new geometry change starts during pointer or
+        // OLE file drags.
+        if should_defer_window_resize(
+            mouse_buttons.any_pressed([MouseButton::Left, MouseButton::Right]),
+            file_drag.drag_active,
+        ) {
+            return;
+        }
+
         if time.elapsed_secs_f64() - runtime.last_resize_at < RESIZE_INTERVAL_SECONDS {
             return;
         }
@@ -305,6 +388,7 @@ mod windows_backend {
         mut mouse_button_events: MessageReader<MouseButtonInput>,
         controls: Res<BlackHoleControls>,
         settings: Res<BlackHoleSettings>,
+        file_drag: Res<DropInteractionState>,
         window: Single<(Entity, &mut CursorOptions), With<PrimaryWindow>>,
         mut runtime: ResMut<OverlayWindowRuntime>,
     ) {
@@ -337,7 +421,7 @@ mod windows_backend {
         // to establish it, so input from the settings window cannot lock this one.
         runtime.release_unpressed_pointer_buttons(&mouse_buttons);
 
-        if controls.pass_through() || runtime.resize_pending {
+        if (controls.pass_through() || runtime.resize_pending) && !file_drag.drag_active {
             runtime.clear_pointer_lock();
             if cursor_options.hit_test {
                 cursor_options.hit_test = false;
@@ -345,7 +429,8 @@ mod windows_backend {
             return;
         }
 
-        let hit = runtime.pointer_locked || cursor_hit;
+        let hit =
+            should_hit_test_overlay(runtime.pointer_locked, cursor_hit, file_drag.drag_active);
 
         // Bevy/winit applies this once in `Last`. Avoid marking the component
         // changed every frame, which otherwise repeatedly calls Win32 style APIs.
@@ -363,7 +448,7 @@ mod windows_backend {
         client_height: i32,
     }
 
-    fn owned_primary_hwnd(runtime: &mut OverlayWindowRuntime) -> Option<HWND> {
+    pub(super) fn owned_primary_hwnd(runtime: &mut OverlayWindowRuntime) -> Option<HWND> {
         if runtime.native_handle != 0 {
             let hwnd = HWND(runtime.native_handle as *mut c_void);
             if belongs_to_current_process(hwnd) {
@@ -419,7 +504,7 @@ mod windows_backend {
         })
     }
 
-    fn cursor_in_client(hwnd: HWND) -> Option<(Vec2, Vec2)> {
+    pub(super) fn cursor_in_client(hwnd: HWND) -> Option<(Vec2, Vec2)> {
         let mut cursor = POINT::default();
         let mut client = RECT::default();
         // SAFETY: Both output structures are writable and `hwnd` is process-owned.
@@ -507,6 +592,39 @@ mod tests {
         assert!(runtime.pointer_locked);
         runtime.update_pointer_button(MouseButton::Right, ButtonState::Released, false);
         assert!(!runtime.pointer_locked);
+    }
+
+    #[test]
+    fn an_external_file_drag_defers_native_window_resizing() {
+        assert!(!should_defer_window_resize(false, false));
+        assert!(should_defer_window_resize(true, false));
+        assert!(should_defer_window_resize(false, true));
+    }
+
+    #[test]
+    fn active_ole_drag_keeps_hit_testing_until_the_session_ends() {
+        assert!(should_hit_test_overlay(false, false, true));
+        assert!(!should_hit_test_overlay(false, false, false));
+        assert!(should_hit_test_overlay(false, true, false));
+    }
+
+    #[test]
+    fn native_cursor_sample_converts_physical_pixels_to_bevy_logical_units() {
+        assert_eq!(
+            logical_cursor_sample(Vec2::new(600.0, 300.0), Vec2::new(1_800.0, 1_400.0), 2.0),
+            Some(PrimaryCursorSample {
+                position: Vec2::new(300.0, 150.0),
+                client_size: Vec2::new(900.0, 700.0),
+            })
+        );
+    }
+
+    #[test]
+    fn native_cursor_sample_rejects_invalid_or_outside_positions() {
+        let size = Vec2::new(1_800.0, 1_400.0);
+        assert!(logical_cursor_sample(Vec2::new(-1.0, 300.0), size, 2.0).is_none());
+        assert!(logical_cursor_sample(Vec2::new(1_800.0, 300.0), size, 2.0).is_none());
+        assert!(logical_cursor_sample(Vec2::new(600.0, 300.0), size, 0.0).is_none());
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 mod black_hole;
 mod desktop_capture;
+mod file_interaction;
+mod file_operations;
+mod file_workflow;
 pub mod physics;
 mod settings;
 mod settings_ui;
@@ -20,6 +23,8 @@ use bevy_egui::EguiPlugin;
 
 use black_hole::BlackHolePlugin;
 use desktop_capture::DesktopCapturePlugin;
+use file_interaction::FileInteractionPlugin;
+use file_workflow::FileWorkflowPlugin;
 use settings_ui::SettingsUiPlugin;
 use window_interaction::WindowInteractionPlugin;
 
@@ -67,6 +72,8 @@ fn main() {
             SettingsUiPlugin,
             DesktopCapturePlugin,
             BlackHolePlugin,
+            FileInteractionPlugin,
+            FileWorkflowPlugin,
             WindowInteractionPlugin,
         ))
         .run();

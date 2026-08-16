@@ -10,6 +10,8 @@ The current implementation is one executable package. The previous six-crate Pha
 src/main.rs
   |-- black_hole.rs          Bevy material, render passes, and embedded WGSL
   |-- desktop_capture.rs     Windows desktop capture and GPU texture upload
+  |-- file_interaction.rs    CF_HDROP intake and file-object visual lifecycle
+  |-- file_operations.rs     Validation, Recycle Bin, and uninstall boundary
   |-- physics.rs             CPU reference equations and invariants
   |-- settings.rs            Sanitized render and interaction settings
   |-- settings_ui.rs         Chinese egui settings window
@@ -50,7 +52,51 @@ The primary window tracks apparent black-hole size and lens influence while keep
 
 Dynamic hit testing claims pointer input only over the central shadow/photon ring and projected emitting disk. Transparent corners and desktop-only lens pixels pass clicks to underlying applications. A drag remains owned only if its press began on interactive primary-window content.
 
+Windows Explorer and desktop file drags arrive through winit's OLE `CF_HDROP` target as Bevy `FileDragAndDrop` messages. Only messages for the primary window are considered. Because the message does not contain an authoritative black-hole-local release point, the current cursor is tested against the rendered target again when `DroppedFile` is received. The external drag has a separate lock from mouse-button ownership: it keeps the intended drop target stable and defers a native resize, while a release outside the black-hole shape is rejected. The settings HWND is never a file-operation source.
+
+winit reports `DROPEFFECT_COPY` for its built-in Windows drop target. Explorer therefore displays a copy cursor even though Sunk performs a separately authorized Recycle Bin or uninstall action after the drop. A truthful native cursor would require replacing that layer with a custom `IDropTarget`; this is an explicit interaction limitation, not a change to the operation policy.
+
 The independent egui window contains General, Display, Quality, and About pages in Chinese. Closing or minimizing it hides it to the Windows notification area. The tray icon restores settings or exits the application.
+
+## File interaction lifecycle
+
+`file_interaction.rs` owns no filesystem or process APIs. It coalesces all paths delivered for one update, preserves first-seen order, removes exact duplicates, and rejects more than 256 unique targets. Hover feedback is driven by the live cursor rather than by a one-time OLE enter event.
+
+Each accepted path receives a stable visual identifier. Ordinary files can begin immediately after validation; application visuals are staged and pause before orbiting until confirmation. The visual phases are attraction, capture, orbit, event-horizon entry, and explicit success or failure. At the event horizon the visual emits an operation-ready message and waits. It disappears as consumed only after the worker reports success; cancellation, validation errors, Recycle Bin failures, and launch failures take the rejection path.
+
+The hand-off is intentionally narrow:
+
+```text
+FileDragAndDrop
+  -> ordered DropBatchRequested
+  -> worker analysis and stable operation intent
+  -> VisualCommand::Begin or VisualCommand::Stage
+  -> VisualOperationReady
+  -> MoveToTrash or LaunchUninstall worker command
+  -> VisualCommand::Complete(success/failure) and Chinese status
+```
+
+Paths remain in the operation coordinator. The renderer and visual entities receive only identifiers, a file/application kind, a start position, and lifecycle commands.
+
+## Recycle Bin boundary
+
+Blocking inspection, COM shell work, and process launch run on a named file-operation worker rather than the Bevy render thread. A normal file or directory is canonicalized and validated immediately before a native `IFileOperation` request with `FOFX_RECYCLEONDELETE` and early-failure flags. Aborted or unsupported recycle operations fail visibly; there is no call to `remove_file`, `remove_dir_all`, or a permanent-delete fallback.
+
+The validator rejects empty or missing targets, drive roots, the Windows directory, Program Files, Program Files (x86), ProgramData, a directory containing any of those protected trees, the running Sunk executable or a directory containing it, reparse points and symbolic links, UNC paths, and other paths that are not local drive-letter paths. `.lnk`, `.exe`, `.appref-ms`, `.url`, and `.website` inputs are never treated as ordinary trashable files.
+
+Validation makes each requested operation auditable but does not turn a multi-file batch into a filesystem transaction. Results are tracked per visual identifier so a partial batch can show individual success and failure accurately.
+
+## Application uninstall boundary
+
+The initial uninstall backend intentionally supports only high-confidence classic Win32 and MSI identities from `.lnk` or `.exe` inputs. A shortcut is resolved with the Windows Shell Link COM interfaces. Candidates are enumerated from current-user and local-machine uninstall records in both 32-bit and 64-bit registry views. System components, update/patch records, entries marked as non-removable, entries without a display name, and entries without an uninstall command are excluded.
+
+MSI product identity is definitive. Other candidates require a unique high score from exact display icon, a specific install location, exact display name, and executable-name evidence. Argument-bearing browser or web-app shortcuts require stronger exact-name evidence. Both a missing candidate and a tied or ambiguous candidate cause rejection rather than an attempt to guess.
+
+Before authorization, the Chinese egui modal shows the application name, unverified registry publisher, install location, and dropped source. Cancel is the initially focused action. Confirmation launches only the captured, validated plan. MSI uses the system `msiexec.exe` with a validated product GUID; traditional uninstall strings are parsed with Windows command-line rules into an absolute local executable plus arguments. Shell and script hosts, unquoted executable paths containing spaces, missing executables, and reparse-point uninstallers are rejected. No command is passed through a shell, and Sunk never deletes an application directory itself.
+
+An `UninstallStarted` result means only that Windows accepted creation of the registered uninstaller process. It must not be presented as proof that the product was fully removed. UWP, MSIX, AppRef, Store applications, and other ambiguous shell identities remain unsupported in this backend.
+
+The rollback branch `backup/pre-file-operations-20260816` fixes the pre-feature boundary at commit `8864a41`. Implementation claims in this document do not replace the outstanding manual Explorer and Windows shell checks recorded in the roadmap.
 
 ## Deployment boundary
 
