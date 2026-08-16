@@ -1083,9 +1083,11 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         let tidal_shift_uv = inward * tidal_mask
             * mix(0.8, 5.2, drag_influence) * target_response / viewport_size;
 
-        // Displacement and coverage share one support value. At the far field
-        // the sampled desktop coordinate now returns smoothly to the unwarped
-        // pixel instead of leaving a low-alpha duplicate image.
+        // Mapping support controls only how the sampled coordinate returns to the
+        // unwarped desktop at the far field and finite-capture boundary. Optical
+        // replacement coverage is derived separately below: using this gradual
+        // mapping value as window alpha would blend the warped capture over the
+        // real desktop a second time and create a visible double image.
         let tentative_deflection = (raw_deflection_uv * warp_amount + tidal_shift_uv)
             * ray_support;
         let mapping = params.desktop_uv_origin_scale;
@@ -1116,15 +1118,16 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         // turning insufficient overscan into a sharp transparent boundary.
         let capture_support = smoothstep(0.5, 16.0, base_edge_pixels)
             * smoothstep(-32.0, 16.0, tentative_edge_pixels);
-        let unified_support = ray_support * capture_support;
-        let warped_uv = uv
-            + (raw_deflection_uv * warp_amount + tidal_shift_uv) * unified_support;
+        let mapping_strength = ray_support * capture_support;
+        let mapped_deflection_uv = (raw_deflection_uv * warp_amount + tidal_shift_uv)
+            * mapping_strength;
+        let warped_uv = uv + mapped_deflection_uv;
         let captured_uv = mapping.xy + warped_uv * mapping.zw;
         let capture_edge_pixels = min(
             min(captured_uv.x * capture_size.x, (1.0 - captured_uv.x) * capture_size.x),
             min(captured_uv.y * capture_size.y, (1.0 - captured_uv.y) * capture_size.y),
         );
-        let capture_coverage = smoothstep(0.0, 6.0, capture_edge_pixels);
+        let capture_validity = smoothstep(-0.5, 1.5, capture_edge_pixels);
         let desktop_color = textureSampleLevel(
             desktop_texture,
             desktop_sampler,
@@ -1132,11 +1135,17 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
             0.0,
         ).rgb;
 
-        // Drag feedback changes the same desktop sample coordinate as gravity;
-        // it must not add a second alpha layer or expose delayed unwarped pixels.
-        let lens_mask = unified_support * capture_coverage;
-        premultiplied_rgb += ray.transmittance * desktop_color * lens_mask;
-        alpha += ray.transmittance * lens_mask;
+        // Any resolvable displacement must replace the real desktop instead of
+        // being composited translucently over it. Only the subpixel outer fringe
+        // fades out, which hides the unwarped desktop throughout the visible lens
+        // while retaining an antialiased transition to the click-through window.
+        let effective_warp_pixels = length(mapped_deflection_uv * viewport_size);
+        let replacement_ramp = smoothstep(0.12, 0.60, effective_warp_pixels);
+        let displacement_coverage = 1.0 - pow(1.0 - replacement_ramp, 4.0);
+        let replacement_coverage = displacement_coverage * capture_validity;
+        let desktop_weight = ray.transmittance * replacement_coverage;
+        premultiplied_rgb += desktop_color * desktop_weight;
+        alpha += desktop_weight;
     }
 
     alpha = clamp(alpha, 0.0, 1.0);
