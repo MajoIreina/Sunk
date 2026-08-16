@@ -26,6 +26,8 @@ var desktop_sampler: sampler;
 const PI: f32 = 3.141592653589793;
 const CRITICAL_IMPACT_PARAMETER_SQUARED: f32 = 6.75;
 const MAX_TRACE_STEPS: u32 = 384u;
+const LENS_ALPHA_FEATHER_PIXELS: f32 = 12.0;
+const LENS_UV_RETURN_PIXELS: f32 = 28.0;
 
 struct RayState {
     position: vec3<f32>,
@@ -65,6 +67,11 @@ struct BackgroundProjection {
     uv: vec2<f32>,
     coverage: f32,
 };
+
+fn smootherstep01(value: f32) -> f32 {
+    let t = clamp(value, 0.0, 1.0);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
 
 fn safe_normalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
     // Scaling first avoids both overflow in dot(v, v) and Inf * 0 when a
@@ -955,11 +962,10 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
     let disk_opacity = clamp(1.0 - ray.transmittance, 0.0, 1.0);
     var premultiplied_rgb = tone_map_premultiplied(ray.radiance, disk_opacity);
     var alpha = disk_opacity;
-    // Lens values are staged so screen-space derivatives can be evaluated after
-    // divergent capture/escape control flow. WGSL derivatives inside the branch
-    // would be undefined for a quad straddling the shadow or disk.
+    // Lens values are staged so the desktop remains a valid premultiplied layer
+    // after the capture/escape branch converges.
     var lens_desktop_color = vec3<f32>(0.0);
-    var lens_warp_pixels = 0.0;
+    var lens_edge_coverage = 0.0;
     var lens_active = 0.0;
 
     if ray.captured > 0.5 {
@@ -1026,13 +1032,24 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
             influence_h / influence_energy_scale,
             critical_impact * 1.08,
         );
-        let influence_coordinate = clamp(
-            (ray.impact_parameter - critical_impact)
-                / max(influence_impact - critical_impact, 0.05),
+        // Convert conserved-impact distance from the requested outer boundary to
+        // approximate output pixels. The last band contains no displaced sample:
+        // UVs return first, then alpha fades, preventing a compressed bright ring.
+        let impact_per_pixel = 2.0 * camera_radius
+            * max(params.viewport_time_fov.w, 1.0e-4)
+            / max(viewport_size.y, 1.0);
+        let edge_distance_pixels = max(
+            (influence_impact - ray.impact_parameter)
+                / max(impact_per_pixel, 1.0e-4),
             0.0,
-            1.0,
         );
-        let far_field_fade = 1.0 - smoothstep(0.62, 1.0, influence_coordinate);
+        lens_edge_coverage = smootherstep01(
+            edge_distance_pixels / LENS_ALPHA_FEATHER_PIXELS,
+        );
+        let lens_uv_support = smootherstep01(
+            (edge_distance_pixels - LENS_ALPHA_FEATHER_PIXELS)
+                / LENS_UV_RETURN_PIXELS,
+        );
 
         let critical_response = impact_response * (0.55 + 0.45 * impact_response);
         let winding_response = 1.0
@@ -1046,8 +1063,8 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         let raw_perceptual_displacement = 1.0 - exp(-0.58 * raw_warp_pixels);
         let raw_displacement_response = raw_visible_displacement
             * raw_perceptual_displacement;
-        let ray_support = clamp(
-            raw_displacement_response * physical_confidence * far_field_fade
+        let physical_support = clamp(
+            raw_displacement_response * physical_confidence
                 * projection.coverage * unbent_projection.coverage,
             0.0,
             1.0,
@@ -1095,7 +1112,7 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         // mapping value as window alpha would blend the warped capture over the
         // real desktop a second time and create a visible double image.
         let tentative_deflection = (raw_deflection_uv * warp_amount + tidal_shift_uv)
-            * ray_support;
+            * physical_support * lens_uv_support;
         let mapping = params.desktop_uv_origin_scale;
         let capture_size = vec2<f32>(textureDimensions(desktop_texture));
         let base_capture_uv = mapping.xy + uv * mapping.zw;
@@ -1124,7 +1141,7 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         // turning insufficient overscan into a sharp transparent boundary.
         let capture_support = smoothstep(0.5, 16.0, base_edge_pixels)
             * smoothstep(-32.0, 16.0, tentative_edge_pixels);
-        let mapping_strength = ray_support * capture_support;
+        let mapping_strength = physical_support * lens_uv_support * capture_support;
         let mapped_deflection_uv = (raw_deflection_uv * warp_amount + tidal_shift_uv)
             * mapping_strength;
         let provisional_capture_uv = base_capture_uv + mapped_deflection_uv * mapping.zw;
@@ -1152,21 +1169,12 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
             clamp(safe_capture_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
             0.0,
         ).rgb;
-        lens_warp_pixels = length(safe_deflection_uv * viewport_size);
-        lens_active = 1.0;
+        if (max(warp_amount, drag_influence) > 1.0e-4) {
+            lens_active = 1.0;
+        }
     }
 
-    // Feather the replacement boundary over about six output pixels. Extending
-    // the ramp across at most one pixel of displacement keeps the weighted
-    // warped-versus-live coordinate difference subpixel while removing the last
-    // abrupt alpha step at the outer ring.
-    let lens_half_width = clamp(3.0 * fwidth(lens_warp_pixels), 0.08, 0.50);
-    let displacement_coverage = smoothstep(
-        0.50 - lens_half_width,
-        0.50 + lens_half_width,
-        lens_warp_pixels,
-    );
-    let replacement_coverage = displacement_coverage * lens_active;
+    let replacement_coverage = lens_edge_coverage * lens_active;
     let desktop_weight = ray.transmittance * replacement_coverage;
     premultiplied_rgb += lens_desktop_color * desktop_weight;
     alpha += desktop_weight;
@@ -1174,7 +1182,11 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
     alpha = clamp(alpha, 0.0, 1.0);
     // The DComp surface consumes premultiplied RGBA. Escaping rays introduce no
     // star/sky color; without desktop capture they remain fully transparent.
-    return vec4<f32>(max(premultiplied_rgb, vec3<f32>(0.0)), alpha);
+    let bounded_rgb = min(
+        max(premultiplied_rgb, vec3<f32>(0.0)),
+        vec3<f32>(alpha),
+    );
+    return vec4<f32>(bounded_rgb, alpha);
 }
 
 @fragment

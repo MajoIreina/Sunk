@@ -21,7 +21,7 @@ use bevy::{
 use crate::desktop_capture::{DesktopCaptureState, DesktopCaptureSystems};
 use crate::file_interaction::{DropInteractionState, FileInteractionSystems};
 use crate::physics::{EVENT_HORIZON_RS, ISCO_RS};
-use crate::settings::BlackHoleSettings;
+use crate::settings::{BlackHoleSettings, clamped_lens_influence_scale};
 use crate::window_interaction::render_tan_half_fov;
 
 const BLACK_HOLE_SHADER_HANDLE: Handle<Shader> =
@@ -29,6 +29,8 @@ const BLACK_HOLE_SHADER_HANDLE: Handle<Shader> =
 const INITIAL_WIDTH: f32 = 900.0;
 const INITIAL_HEIGHT: f32 = 700.0;
 const CAMERA_DISTANCE_RS: f32 = 30.0;
+const DISK_OUTER_RADIUS_RS: f32 = 11.5;
+const DISK_LENSING_PADDING: f32 = 1.10;
 const CRITICAL_IMPACT_PARAMETER_RS: f32 = 2.598_076;
 const BACKGROUND_INFLUENCE_SHADOW_RADII: f32 = 3.45;
 const SSAA_SAMPLE_OFFSETS: [Vec2; 4] = [
@@ -174,7 +176,7 @@ impl Default for BlackHoleUniform {
                 (42.0_f32.to_radians() * 0.5).tan(),
             ),
             camera: Vec4::new(-0.34, 0.26, CAMERA_DISTANCE_RS, 0.0),
-            disk: Vec4::new(ISCO_RS, 11.5, 0.14, 0.34),
+            disk: Vec4::new(ISCO_RS, DISK_OUTER_RADIUS_RS, 0.14, 0.34),
             integration: Vec4::new(EVENT_HORIZON_RS, 192.0, 1.0, 0.050),
             appearance: Vec4::new(7.0, 3.6, 1.0, 1.0),
             material: Vec4::new(10_500.0, 0.55, 0.72, 0.78),
@@ -375,7 +377,7 @@ fn sync_material(
         camera: Vec4::new(controls.yaw, controls.pitch, CAMERA_DISTANCE_RS, 0.0),
         disk: Vec4::new(
             ISCO_RS,
-            11.5,
+            DISK_OUTER_RADIUS_RS,
             0.14 * settings.disk_thickness,
             settings.animation_speed,
         ),
@@ -456,9 +458,13 @@ fn sample_parameters(sample_index: usize, spatial_samples: u32) -> Vec4 {
 }
 
 fn background_influence_radius(tan_half_fov: f32, camera_distance: f32, scale: f32) -> f32 {
-    let shadow_radius =
-        CRITICAL_IMPACT_PARAMETER_RS / (camera_distance.max(1.01) * tan_half_fov.max(1.0e-4));
-    (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * scale).clamp(0.12, 3.0)
+    let camera_distance = camera_distance.max(1.01);
+    let tan_half_fov = tan_half_fov.max(1.0e-4);
+    let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS / (camera_distance * tan_half_fov);
+    let requested =
+        shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * clamped_lens_influence_scale(scale);
+    let disk_major = DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (camera_distance * tan_half_fov);
+    requested.clamp(0.12, 3.0).min(disk_major)
 }
 
 fn capture_qa_frame(
@@ -493,6 +499,22 @@ mod tests {
 
         assert!(small < normal && normal < large);
         assert!((large / normal - 2.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn maximum_background_influence_stops_at_visible_disk_edge() {
+        let base_tan = (42.0_f32.to_radians() * 0.5).tan();
+        for tan_half_fov in [base_tan * 0.5, base_tan, base_tan * 2.0] {
+            let influence = background_influence_radius(
+                tan_half_fov,
+                CAMERA_DISTANCE_RS,
+                crate::settings::LENS_INFLUENCE_SCALE_MAX,
+            );
+            let disk_major =
+                DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+            assert!(influence <= disk_major);
+            assert!(influence / disk_major > 0.998);
+        }
     }
 
     #[test]

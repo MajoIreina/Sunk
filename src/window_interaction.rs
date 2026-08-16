@@ -7,8 +7,9 @@ use bevy::{
 };
 
 use crate::{
-    black_hole::BlackHoleControls, file_interaction::DropInteractionState,
-    settings::BlackHoleSettings,
+    black_hole::BlackHoleControls,
+    file_interaction::DropInteractionState,
+    settings::{BlackHoleSettings, clamped_lens_influence_scale},
 };
 
 const PRIMARY_WINDOW_TITLE: &str = "Sunk Black Hole";
@@ -62,7 +63,7 @@ fn composition_scale(lens_radius_scale: f32) -> f32 {
         DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * base_tan_half_fov);
     let lens_extent = CRITICAL_IMPACT_PARAMETER_RS
         * BACKGROUND_INFLUENCE_SHADOW_RADII
-        * lens_radius_scale.clamp(0.4, 2.0)
+        * clamped_lens_influence_scale(lens_radius_scale)
         / (CAMERA_DISTANCE_RS * base_tan_half_fov);
 
     MIN_COMPOSITION_SCALE.max(disk_extent.max(lens_extent) / CONTENT_SAFE_RADIUS)
@@ -142,11 +143,15 @@ fn cursor_hits_lens_influence(cursor: Vec2, client_size: Vec2, lens_radius_scale
         (cursor.x / client_size.x * 2.0 - 1.0) * aspect,
         1.0 - cursor.y / client_size.y * 2.0,
     );
-    let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS
-        / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius_scale));
-    let influence_radius =
-        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius_scale.clamp(0.4, 2.0))
-            .clamp(0.12, 3.0);
+    let tan_half_fov = render_tan_half_fov(lens_radius_scale);
+    let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS / (CAMERA_DISTANCE_RS * tan_half_fov);
+    let disk_major =
+        DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+    let influence_radius = (shadow_radius
+        * BACKGROUND_INFLUENCE_SHADOW_RADII
+        * clamped_lens_influence_scale(lens_radius_scale))
+    .clamp(0.12, 3.0)
+    .min(disk_major);
     let radius_squared = influence_radius * influence_radius;
     let boundary_tolerance = radius_squared * (8.0 * f32::EPSILON);
     screen.length_squared() <= radius_squared + boundary_tolerance
@@ -701,12 +706,18 @@ mod windows_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{LENS_INFLUENCE_SCALE_MAX, LENS_INFLUENCE_SCALE_MIN};
 
     fn lens_influence_radius(lens_radius_scale: f32) -> f32 {
-        let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS
-            / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius_scale));
-        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius_scale.clamp(0.4, 2.0))
-            .clamp(0.12, 3.0)
+        let tan_half_fov = render_tan_half_fov(lens_radius_scale);
+        let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS / (CAMERA_DISTANCE_RS * tan_half_fov);
+        let disk_major =
+            DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+        (shadow_radius
+            * BACKGROUND_INFLUENCE_SHADOW_RADII
+            * clamped_lens_influence_scale(lens_radius_scale))
+        .clamp(0.12, 3.0)
+        .min(disk_major)
     }
 
     fn cursor_for_screen_point(screen: Vec2, client_size: Vec2) -> Vec2 {
@@ -853,7 +864,7 @@ mod tests {
 
     #[test]
     fn composition_keeps_adjustable_lens_inside_safe_radius() {
-        for lens_scale in [0.4, 1.0, 2.0] {
+        for lens_scale in [LENS_INFLUENCE_SCALE_MIN, 1.0, LENS_INFLUENCE_SCALE_MAX] {
             let radius =
                 CRITICAL_IMPACT_PARAMETER_RS * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_scale
                     / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_scale));
@@ -862,9 +873,34 @@ mod tests {
     }
 
     #[test]
+    fn maximum_lens_influence_does_not_cross_visible_disk_edge() {
+        let lens_extent = CRITICAL_IMPACT_PARAMETER_RS
+            * BACKGROUND_INFLUENCE_SHADOW_RADII
+            * LENS_INFLUENCE_SCALE_MAX;
+        let disk_extent = DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING;
+
+        assert!(lens_extent <= disk_extent);
+        assert!(lens_extent / disk_extent > 0.998);
+    }
+
+    #[test]
+    fn lens_range_setting_does_not_resize_the_disk_composition() {
+        let roomy = UVec2::new(4_000, 3_000);
+        let (minimum, minimum_apparent) = target_client_size(1.0, LENS_INFLUENCE_SCALE_MIN, roomy);
+        let (maximum, maximum_apparent) = target_client_size(1.0, LENS_INFLUENCE_SCALE_MAX, roomy);
+
+        assert_eq!(minimum, maximum);
+        assert_eq!(minimum_apparent, maximum_apparent);
+        assert_eq!(
+            render_tan_half_fov(LENS_INFLUENCE_SCALE_MIN),
+            render_tan_half_fov(LENS_INFLUENCE_SCALE_MAX)
+        );
+    }
+
+    #[test]
     fn lens_influence_contains_the_client_center() {
         let size = Vec2::new(1_600.0, 900.0);
-        for lens_scale in [0.4, 1.0, 2.0] {
+        for lens_scale in [LENS_INFLUENCE_SCALE_MIN, 1.0, LENS_INFLUENCE_SCALE_MAX] {
             assert!(cursor_hits_lens_influence(size * 0.5, size, lens_scale));
         }
     }

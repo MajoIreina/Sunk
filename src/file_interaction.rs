@@ -19,7 +19,7 @@ use bevy::{
 
 use crate::{
     black_hole::BlackHoleControls,
-    settings::BlackHoleSettings,
+    settings::{BlackHoleSettings, clamped_lens_influence_scale},
     window_interaction::{OverlayWindowRuntime, primary_cursor_sample, render_tan_half_fov},
 };
 
@@ -1135,11 +1135,16 @@ fn drag_lens_influence_strength(cursor: Vec2, size: Vec2, lens_radius: f32) -> f
         (cursor.x / size.x * 2.0 - 1.0) * aspect,
         1.0 - cursor.y / size.y * 2.0,
     );
+    let tan_half_fov = render_tan_half_fov(lens_radius);
     let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
-    let influence_radius =
-        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius.clamp(0.4, 2.0))
-            .clamp(0.12, 3.0)
-            .max(shadow_radius * 1.08);
+    let disk_major =
+        DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+    let influence_radius = (shadow_radius
+        * BACKGROUND_INFLUENCE_SHADOW_RADII
+        * clamped_lens_influence_scale(lens_radius))
+    .clamp(0.12, 3.0)
+    .max(shadow_radius * 1.08)
+    .min(disk_major);
     let coordinate = ((screen.length() - shadow_radius)
         / (influence_radius - shadow_radius).max(0.01))
     .clamp(0.0, 1.0);
@@ -2009,6 +2014,18 @@ mod tests {
     }
 
     #[test]
+    fn maximum_drag_influence_does_not_cross_visible_disk_edge() {
+        let lens_radius = crate::settings::LENS_INFLUENCE_SCALE_MAX;
+        let tan_half_fov = render_tan_half_fov(lens_radius);
+        let disk_major =
+            DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+        let influence_radius = test_drag_influence_radius(lens_radius);
+
+        assert!(influence_radius <= disk_major);
+        assert!(influence_radius / disk_major > 0.998);
+    }
+
+    #[test]
     fn drag_lens_influence_rejects_invalid_cursor_and_degenerate_windows() {
         let center = Vec2::splat(0.5);
         for size in [
@@ -2074,10 +2091,16 @@ mod tests {
     }
 
     fn test_drag_influence_radius(lens_radius: f32) -> f32 {
+        let tan_half_fov = render_tan_half_fov(lens_radius);
         let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
-        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius.clamp(0.4, 2.0))
-            .clamp(0.12, 3.0)
-            .max(shadow_radius * 1.08)
+        let disk_major =
+            DISK_OUTER_RADIUS_RS * DISK_LENSING_PADDING / (CAMERA_DISTANCE_RS * tan_half_fov);
+        (shadow_radius
+            * BACKGROUND_INFLUENCE_SHADOW_RADII
+            * clamped_lens_influence_scale(lens_radius))
+        .clamp(0.12, 3.0)
+        .max(shadow_radius * 1.08)
+        .min(disk_major)
     }
 
     fn test_visual(authorized: bool) -> DropVisual {

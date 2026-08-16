@@ -14,7 +14,10 @@ use bevy::{
 use bevy_egui::{EguiContext, EguiGlobalSettings, EguiMultipassSchedule, EguiPlugin, egui};
 
 use crate::desktop_capture::DesktopCaptureState;
-use crate::settings::{AntiAliasingMode, BlackHoleSettings, FrameRateLimit, RenderQuality};
+use crate::settings::{
+    AntiAliasingMode, BlackHoleSettings, FrameRateLimit, LENS_INFLUENCE_SCALE_MAX,
+    LENS_INFLUENCE_SCALE_MIN, RenderQuality,
+};
 
 #[cfg(target_os = "windows")]
 #[path = "system_tray.rs"]
@@ -695,8 +698,14 @@ fn display_tab(
     );
     described_slider(
         ui,
-        egui::Slider::new(&mut settings.lens_radius, 0.4..=2.0).text("背景影响范围"),
-        "缩放由黑洞表观半径推导出的透镜影响范围，会随黑洞大小同步变化。",
+        egui::Slider::new(
+            &mut settings.lens_radius,
+            LENS_INFLUENCE_SCALE_MIN..=LENS_INFLUENCE_SCALE_MAX,
+        )
+        .fixed_decimals(2)
+        .suffix(" 倍")
+        .text("引力透镜影响范围"),
+        "调节桌面画面受到引力偏折的最远范围。1.00 为物理基准；最大值对齐吸积盘可见的左右边缘，不会延伸到盘外。",
     );
     described_slider(
         ui,

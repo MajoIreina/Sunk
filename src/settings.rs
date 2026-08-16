@@ -2,6 +2,14 @@ use bevy::prelude::Resource;
 
 use std::time::Duration;
 
+pub(crate) const LENS_INFLUENCE_SCALE_MIN: f32 = 0.40;
+pub(crate) const LENS_INFLUENCE_SCALE_DEFAULT: f32 = 1.00;
+// (11.5 Rs disk radius * 1.10 visible padding) /
+// (2.598076 critical impact * 3.45 baseline influence radii) = 1.4113.
+// Staying just below that value guarantees the lens never crosses the visible
+// left/right edge of the accretion disk despite floating-point roundoff.
+pub(crate) const LENS_INFLUENCE_SCALE_MAX: f32 = 1.41;
+
 /// User-selectable update and render cadence for the desktop effect.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FrameRateLimit {
@@ -149,7 +157,8 @@ pub struct BlackHoleSettings {
     pub emission_strength: f32,
     /// Amount of escaped-ray displacement applied to the captured desktop.
     pub background_warp: f32,
-    /// Multiplier applied to the physically derived background influence radius.
+    /// Dimensionless multiplier applied to the physically derived lens extent.
+    /// Its maximum aligns with the visible horizontal edge of the accretion disk.
     pub lens_radius: f32,
     /// Optical depth of the faint hot corona around the disk.
     pub corona_opacity: f32,
@@ -175,7 +184,7 @@ impl Default for BlackHoleSettings {
             disk_thickness: 1.0,
             emission_strength: 1.8,
             background_warp: 1.0,
-            lens_radius: 1.0,
+            lens_radius: LENS_INFLUENCE_SCALE_DEFAULT,
             corona_opacity: 0.55,
             turbulence: 0.72,
             cloudiness: 0.78,
@@ -199,7 +208,7 @@ impl BlackHoleSettings {
         self.disk_thickness = finite_or(self.disk_thickness, 1.0).clamp(0.25, 3.0);
         self.emission_strength = finite_or(self.emission_strength, 1.8).clamp(0.1, 10.0);
         self.background_warp = finite_or(self.background_warp, 1.0).clamp(0.0, 1.5);
-        self.lens_radius = finite_or(self.lens_radius, 1.0).clamp(0.4, 2.0);
+        self.lens_radius = clamped_lens_influence_scale(self.lens_radius);
         self.corona_opacity = finite_or(self.corona_opacity, 0.55).clamp(0.0, 1.5);
         self.turbulence = finite_or(self.turbulence, 0.72).clamp(0.0, 1.0);
         self.cloudiness = finite_or(self.cloudiness, 0.78).clamp(0.0, 1.0);
@@ -213,6 +222,11 @@ impl BlackHoleSettings {
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
+}
+
+pub(crate) fn clamped_lens_influence_scale(value: f32) -> f32 {
+    finite_or(value, LENS_INFLUENCE_SCALE_DEFAULT)
+        .clamp(LENS_INFLUENCE_SCALE_MIN, LENS_INFLUENCE_SCALE_MAX)
 }
 
 #[cfg(test)]
@@ -278,7 +292,20 @@ mod tests {
         assert_eq!(settings.apparent_size, 1.0);
         assert_eq!(settings.animation_speed, 1.0);
         assert_eq!(settings.cloudiness, 0.78);
-        assert_eq!(settings.lens_radius, 2.0);
+        assert_eq!(settings.lens_radius, LENS_INFLUENCE_SCALE_MAX);
         assert_eq!(settings.disk_tint_linear, [0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn lens_influence_scale_recovers_invalid_values_and_respects_disk_edge_limit() {
+        assert_eq!(
+            clamped_lens_influence_scale(f32::NAN),
+            LENS_INFLUENCE_SCALE_DEFAULT
+        );
+        assert_eq!(
+            clamped_lens_influence_scale(-10.0),
+            LENS_INFLUENCE_SCALE_MIN
+        );
+        assert_eq!(clamped_lens_influence_scale(10.0), LENS_INFLUENCE_SCALE_MAX);
     }
 }
