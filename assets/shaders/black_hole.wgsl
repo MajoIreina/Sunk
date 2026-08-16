@@ -955,6 +955,12 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
     let disk_opacity = clamp(1.0 - ray.transmittance, 0.0, 1.0);
     var premultiplied_rgb = tone_map_premultiplied(ray.radiance, disk_opacity);
     var alpha = disk_opacity;
+    // Lens values are staged so screen-space derivatives can be evaluated after
+    // divergent capture/escape control flow. WGSL derivatives inside the branch
+    // would be undefined for a quad straddling the shadow or disk.
+    var lens_desktop_color = vec3<f32>(0.0);
+    var lens_warp_pixels = 0.0;
+    var lens_active = 0.0;
 
     if ray.captured > 0.5 {
         // Keep the disk's accumulated transmittance separate: setting it to zero
@@ -1121,32 +1127,49 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         let mapping_strength = ray_support * capture_support;
         let mapped_deflection_uv = (raw_deflection_uv * warp_amount + tidal_shift_uv)
             * mapping_strength;
-        let warped_uv = uv + mapped_deflection_uv;
-        let captured_uv = mapping.xy + warped_uv * mapping.zw;
+        let provisional_capture_uv = base_capture_uv + mapped_deflection_uv * mapping.zw;
         let capture_edge_pixels = min(
-            min(captured_uv.x * capture_size.x, (1.0 - captured_uv.x) * capture_size.x),
-            min(captured_uv.y * capture_size.y, (1.0 - captured_uv.y) * capture_size.y),
+            min(
+                provisional_capture_uv.x * capture_size.x,
+                (1.0 - provisional_capture_uv.x) * capture_size.x,
+            ),
+            min(
+                provisional_capture_uv.y * capture_size.y,
+                (1.0 - provisional_capture_uv.y) * capture_size.y,
+            ),
         );
-        let capture_validity = smoothstep(-0.5, 1.5, capture_edge_pixels);
-        let desktop_color = textureSampleLevel(
+        // When overscan is insufficient, return the sample coordinate to the
+        // unwarped desktop across a broad capture-space band. Fading validity
+        // directly would reveal the live desktop underneath a displaced sample.
+        let capture_mapping_support = smoothstep(-8.0, 16.0, capture_edge_pixels);
+        let base_mapping_support = smoothstep(-0.5, 5.5, base_edge_pixels);
+        let safe_deflection_uv = mapped_deflection_uv
+            * capture_mapping_support * base_mapping_support;
+        let safe_capture_uv = base_capture_uv + safe_deflection_uv * mapping.zw;
+        lens_desktop_color = textureSampleLevel(
             desktop_texture,
             desktop_sampler,
-            clamp(captured_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+            clamp(safe_capture_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
             0.0,
         ).rgb;
-
-        // Any resolvable displacement must replace the real desktop instead of
-        // being composited translucently over it. Only the subpixel outer fringe
-        // fades out, which hides the unwarped desktop throughout the visible lens
-        // while retaining an antialiased transition to the click-through window.
-        let effective_warp_pixels = length(mapped_deflection_uv * viewport_size);
-        let replacement_ramp = smoothstep(0.12, 0.60, effective_warp_pixels);
-        let displacement_coverage = 1.0 - pow(1.0 - replacement_ramp, 4.0);
-        let replacement_coverage = displacement_coverage * capture_validity;
-        let desktop_weight = ray.transmittance * replacement_coverage;
-        premultiplied_rgb += desktop_color * desktop_weight;
-        alpha += desktop_weight;
+        lens_warp_pixels = length(safe_deflection_uv * viewport_size);
+        lens_active = 1.0;
     }
+
+    // Feather the replacement boundary over about six output pixels. Extending
+    // the ramp across at most one pixel of displacement keeps the weighted
+    // warped-versus-live coordinate difference subpixel while removing the last
+    // abrupt alpha step at the outer ring.
+    let lens_half_width = clamp(3.0 * fwidth(lens_warp_pixels), 0.08, 0.50);
+    let displacement_coverage = smoothstep(
+        0.50 - lens_half_width,
+        0.50 + lens_half_width,
+        lens_warp_pixels,
+    );
+    let replacement_coverage = displacement_coverage * lens_active;
+    let desktop_weight = ray.transmittance * replacement_coverage;
+    premultiplied_rgb += lens_desktop_color * desktop_weight;
+    alpha += desktop_weight;
 
     alpha = clamp(alpha, 0.0, 1.0);
     // The DComp surface consumes premultiplied RGBA. Escaping rays introduce no
