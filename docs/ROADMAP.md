@@ -29,7 +29,7 @@
 - [x] Accept Explorer and desktop `CF_HDROP` messages on the primary black-hole window (implemented this iteration; manual coverage pending)
 - [x] Re-check the shaped drop target on release and isolate primary-window drops from the settings HWND
 - [x] Preserve first-seen multi-file order, remove exact duplicates, and reject batches above 256 unique targets
-- [x] Add hover, attraction, capture, orbit, event-horizon wait, success, and failure visuals
+- [x] Add hover, radial infall with near-horizon slowdown, progressive shadow occlusion, success, and failure visuals
 - [x] Move validated ordinary files and directories only to the Windows Recycle Bin on a worker thread
 - [x] Reject protected paths, drive roots, reparse points, symbolic links, UNC/network paths, application launchers, and the running Sunk path from ordinary disposal
 - [x] Resolve classic `.lnk` and `.exe` application identities against unique high-confidence Win32/MSI uninstall records

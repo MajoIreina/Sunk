@@ -1,4 +1,4 @@
-//! File drag-and-drop intake and the visual hand-off around the black hole.
+//! File drag-and-drop intake and the visual hand-off into the black hole.
 //!
 //! This module deliberately does not touch the filesystem. It accepts paths only
 //! when Explorer releases them over the primary window's current black-hole hit
@@ -25,19 +25,21 @@ use crate::{
 
 const MAX_DROP_BATCH_SIZE: usize = 256;
 const VISUAL_QUEUE_INTERVAL_SECONDS: f64 = 0.120;
-const ATTRACTING_SECONDS: f32 = 0.320;
-const CAPTURING_SECONDS: f32 = 0.240;
-const ORBITING_SECONDS: f32 = 0.960;
-const EVENT_HORIZON_SECONDS: f32 = 0.320;
-const SUCCESS_SECONDS: f32 = 0.440;
+const ATTRACTING_SECONDS: f32 = 0.260;
+const CAPTURING_SECONDS: f32 = 0.180;
+const INFALLING_SECONDS: f32 = 0.720;
+const EVENT_HORIZON_SECONDS: f32 = 0.240;
+const SUCCESS_SECONDS: f32 = 0.120;
 const FAILURE_SECONDS: f32 = 0.680;
 const INVALID_DROP_PULSE_SECONDS: f32 = 0.520;
 const VISUAL_Z: f32 = 100.0;
+const ICON_MAX_HALF_DIAGONAL: f32 = 42.0;
 
 const CAMERA_DISTANCE_RS: f32 = 30.0;
 const DISK_OUTER_RADIUS_RS: f32 = 11.5;
 const CRITICAL_IMPACT_PARAMETER_RS: f32 = 2.598_076;
 const DISK_LENSING_PADDING: f32 = 1.10;
+const SHADOW_INTERACTION_PADDING: f32 = 1.18;
 
 /// Stable identifier assigned by the file-operation coordinator.
 pub(crate) type DropVisualId = u64;
@@ -65,7 +67,7 @@ pub(crate) enum VisualCommand {
         kind: DropVisualKind,
         start_position: Vec2,
     },
-    /// Shows the attraction/capture feedback but holds before orbiting. This is
+    /// Shows the attraction/capture feedback but holds before infall. This is
     /// useful while an application uninstall confirmation dialog is open.
     Stage {
         id: DropVisualId,
@@ -146,7 +148,7 @@ pub(crate) struct DropInteractionState {
     queued_visuals: VecDeque<QueuedVisual>,
     active_ids: HashSet<DropVisualId>,
     next_visual_spawn_at: f64,
-    next_orbit_lane: u8,
+    next_infall_lane: u8,
     invalid_drop_pulse: Option<TransientPulse>,
 }
 
@@ -171,15 +173,23 @@ struct DropVisual {
     phase: VisualPhase,
     elapsed: f32,
     start_position: Vec2,
-    failure_origin: Vec2,
-    orbit_lane: u8,
+    failure: FailureVisualState,
+    infall_lane: u8,
     authorized: bool,
     operation_ready_emitted: bool,
     operation_succeeded: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FailureVisualState {
+    origin: Vec2,
+    scale: f32,
+    alpha: f32,
+}
+
 #[derive(Component, Debug, Clone, Copy)]
 struct DropVisualPart {
+    size: Vec2,
     base_rgb: [f32; 3],
     base_alpha: f32,
 }
@@ -188,7 +198,7 @@ struct DropVisualPart {
 enum VisualPhase {
     Attracting,
     Capturing,
-    Orbiting,
+    Infalling,
     EnteringEventHorizon,
     Success,
     Failure,
@@ -200,6 +210,7 @@ struct VisualSample {
     scale: f32,
     rotation: f32,
     alpha: f32,
+    redshift: f32,
 }
 
 #[allow(
@@ -331,9 +342,7 @@ fn receive_visual_commands(
                     // A result is trusted only after this module requested the
                     // operation. This prevents a stale response from skipping
                     // validation and playing a false-positive consume effect.
-                    if visual.operation_ready_emitted
-                        && visual.phase == VisualPhase::EnteringEventHorizon
-                    {
+                    if can_accept_operation_success(&visual) {
                         visual.operation_succeeded = true;
                     }
                 } else {
@@ -364,6 +373,10 @@ fn receive_visual_commands(
             }
         }
     }
+}
+
+fn can_accept_operation_success(visual: &DropVisual) -> bool {
+    visual.operation_ready_emitted && visual.phase == VisualPhase::EnteringEventHorizon
 }
 
 fn queue_visual(
@@ -397,13 +410,13 @@ fn spawn_queued_visuals(
         return;
     };
 
-    let orbit_lane = state.next_orbit_lane;
-    state.next_orbit_lane = (state.next_orbit_lane + 1) % 4;
+    let infall_lane = state.next_infall_lane;
+    state.next_infall_lane = (state.next_infall_lane + 1) % 4;
     state.next_visual_spawn_at = now + VISUAL_QUEUE_INTERVAL_SECONDS;
-    spawn_visual(&mut commands, queued, orbit_lane);
+    spawn_visual(&mut commands, queued, infall_lane);
 }
 
-fn spawn_visual(commands: &mut Commands, queued: QueuedVisual, orbit_lane: u8) {
+fn spawn_visual(commands: &mut Commands, queued: QueuedVisual, infall_lane: u8) {
     commands
         .spawn((
             DropVisual {
@@ -412,8 +425,12 @@ fn spawn_visual(commands: &mut Commands, queued: QueuedVisual, orbit_lane: u8) {
                 phase: VisualPhase::Attracting,
                 elapsed: 0.0,
                 start_position: queued.start_position,
-                failure_origin: queued.start_position,
-                orbit_lane,
+                failure: FailureVisualState {
+                    origin: queued.start_position,
+                    scale: 1.0,
+                    alpha: 1.0,
+                },
+                infall_lane,
                 authorized: queued.authorized,
                 operation_ready_emitted: false,
                 operation_succeeded: false,
@@ -505,6 +522,7 @@ fn spawn_icon_part(
         ),
         Transform::from_translation(translation),
         DropVisualPart {
+            size,
             base_rgb,
             base_alpha,
         },
@@ -519,9 +537,10 @@ fn animate_visuals(
     mut commands: Commands,
     time: Res<Time>,
     primary_window: Single<&Window, With<PrimaryWindow>>,
+    settings: Res<BlackHoleSettings>,
     mut state: ResMut<DropInteractionState>,
     mut visuals: Query<(Entity, &mut DropVisual, &mut Transform, &Children)>,
-    mut parts: Query<(&DropVisualPart, &mut Sprite), Without<DropVisual>>,
+    mut parts: Query<(&DropVisualPart, &Transform, &mut Sprite), Without<DropVisual>>,
     mut operation_ready: MessageWriter<VisualOperationReady>,
 ) {
     let delta = time.delta_secs().min(0.1);
@@ -543,9 +562,10 @@ fn animate_visuals(
             visual.phase,
             visual.elapsed,
             visual.start_position,
-            visual.failure_origin,
-            visual.orbit_lane,
+            visual.failure,
+            visual.infall_lane,
             viewport_size,
+            settings.lens_radius,
         );
 
         transform.translation = sample.position.extend(VISUAL_Z);
@@ -553,14 +573,31 @@ fn animate_visuals(
         transform.scale = Vec3::splat(sample.scale.max(0.001));
 
         let failure = visual.phase == VisualPhase::Failure;
+        if !failure {
+            visual.failure.scale = sample.scale;
+            visual.failure.alpha = sample.alpha;
+        }
+        let shadow_radius = rendered_shadow_radius(viewport_size, settings.lens_radius);
         for child in children.iter() {
-            if let Ok((part, mut sprite)) = parts.get_mut(child) {
+            if let Ok((part, child_transform, mut sprite)) = parts.get_mut(child) {
                 let rgb = if failure {
                     mix_rgb(part.base_rgb, [1.0, 0.12, 0.08], 0.82)
                 } else {
-                    part.base_rgb
+                    apply_gravitational_redshift(part.base_rgb, sample.redshift)
                 };
-                sprite.color = Color::srgba(rgb[0], rgb[1], rgb[2], sample.alpha * part.base_alpha);
+                let geometric_visibility = shadow_visibility(
+                    sample.position,
+                    sample.scale,
+                    child_transform.translation.truncate(),
+                    part.size,
+                    shadow_radius,
+                );
+                sprite.color = Color::srgba(
+                    rgb[0],
+                    rgb[1],
+                    rgb[2],
+                    sample.alpha * geometric_visibility * part.base_alpha,
+                );
             }
         }
 
@@ -579,58 +616,85 @@ struct VisualAdvance {
 
 fn advance_visual(visual: &mut DropVisual, delta: f32) -> VisualAdvance {
     let mut advance = VisualAdvance::default();
-    match visual.phase {
-        VisualPhase::Attracting => {
-            visual.elapsed += delta;
-            if visual.elapsed >= ATTRACTING_SECONDS {
+    let mut remaining = if delta.is_finite() {
+        delta.max(0.0)
+    } else {
+        0.0
+    };
+
+    for _ in 0..6 {
+        match visual.phase {
+            VisualPhase::Attracting => {
+                if !consume_phase_time(&mut visual.elapsed, ATTRACTING_SECONDS, &mut remaining) {
+                    break;
+                }
                 visual.phase = VisualPhase::Capturing;
-                visual.elapsed = 0.0;
             }
-        }
-        VisualPhase::Capturing => {
-            visual.elapsed = (visual.elapsed + delta).min(CAPTURING_SECONDS);
-            if visual.authorized && visual.elapsed >= CAPTURING_SECONDS {
-                visual.phase = VisualPhase::Orbiting;
-                visual.elapsed = 0.0;
+            VisualPhase::Capturing => {
+                if !visual.authorized {
+                    visual.elapsed = (visual.elapsed + remaining).min(CAPTURING_SECONDS);
+                    break;
+                }
+                if !consume_phase_time(&mut visual.elapsed, CAPTURING_SECONDS, &mut remaining) {
+                    break;
+                }
+                visual.phase = VisualPhase::Infalling;
             }
-        }
-        VisualPhase::Orbiting => {
-            visual.elapsed += delta;
-            if visual.elapsed >= ORBITING_SECONDS {
+            VisualPhase::Infalling => {
+                if !consume_phase_time(&mut visual.elapsed, INFALLING_SECONDS, &mut remaining) {
+                    break;
+                }
                 visual.phase = VisualPhase::EnteringEventHorizon;
-                visual.elapsed = 0.0;
                 if !visual.operation_ready_emitted {
                     advance.operation_ready = Some(visual.id);
                     visual.operation_ready_emitted = true;
                 }
+                // The operation cannot succeed before the ready message is
+                // observed, so excess frame time stops at the visible boundary.
+                break;
             }
-        }
-        VisualPhase::EnteringEventHorizon => {
-            // Hold visibly at the boundary until the real operation succeeds.
-            if visual.operation_succeeded {
-                visual.elapsed += delta;
-                if visual.elapsed >= EVENT_HORIZON_SECONDS {
-                    visual.phase = VisualPhase::Success;
-                    visual.elapsed = 0.0;
+            VisualPhase::EnteringEventHorizon => {
+                // Hold visibly at the boundary until the real operation succeeds.
+                if !visual.operation_succeeded {
+                    break;
                 }
+                if !consume_phase_time(&mut visual.elapsed, EVENT_HORIZON_SECONDS, &mut remaining) {
+                    break;
+                }
+                visual.phase = VisualPhase::Success;
             }
-        }
-        VisualPhase::Success => {
-            visual.elapsed += delta;
-            advance.finished = visual.elapsed >= SUCCESS_SECONDS;
-        }
-        VisualPhase::Failure => {
-            visual.elapsed += delta;
-            advance.finished = visual.elapsed >= FAILURE_SECONDS;
+            VisualPhase::Success => {
+                advance.finished =
+                    consume_phase_time(&mut visual.elapsed, SUCCESS_SECONDS, &mut remaining);
+                break;
+            }
+            VisualPhase::Failure => {
+                advance.finished =
+                    consume_phase_time(&mut visual.elapsed, FAILURE_SECONDS, &mut remaining);
+                break;
+            }
         }
     }
     advance
 }
 
+fn consume_phase_time(elapsed: &mut f32, duration: f32, remaining: &mut f32) -> bool {
+    let until_end = (duration - *elapsed).max(0.0);
+    if *remaining + f32::EPSILON < until_end {
+        *elapsed += *remaining;
+        *remaining = 0.0;
+        false
+    } else {
+        *remaining = (*remaining - until_end).max(0.0);
+        *elapsed = 0.0;
+        true
+    }
+}
+
 fn begin_failure(visual: &mut DropVisual, origin: Vec2) {
     visual.phase = VisualPhase::Failure;
     visual.elapsed = 0.0;
-    visual.failure_origin = origin;
+    visual.failure.origin = origin;
     visual.operation_succeeded = false;
 }
 
@@ -638,28 +702,29 @@ fn draw_interaction_feedback(
     time: Res<Time>,
     state: Res<DropInteractionState>,
     primary_window: Single<&Window, With<PrimaryWindow>>,
+    settings: Res<BlackHoleSettings>,
     visuals: Query<&DropVisual>,
     mut gizmos: Gizmos,
 ) {
     let viewport_size = Vec2::new(primary_window.width(), primary_window.height());
     let minimum_extent = viewport_size.min_element().max(1.0);
+    let horizon_radius = rendered_shadow_radius(viewport_size, settings.lens_radius);
 
     if state.drag_active && state.hovering_black_hole {
-        let pulse = 0.5 + 0.5 * (time.elapsed_secs() * 5.2).sin();
-        let radius = minimum_extent * (0.086 + 0.008 * pulse);
-        let alpha = 0.34 + 0.36 * pulse;
-        draw_dashed_ring(
-            &mut gizmos,
-            Vec2::ZERO,
-            radius,
-            time.elapsed_secs() * -0.72,
-            Color::srgba(1.0, 0.72, 0.32, alpha),
-        );
+        let contraction = (time.elapsed_secs() * 1.45).fract();
+        for offset in [0.0, 0.5] {
+            let t = (contraction + offset).fract();
+            let radius = horizon_radius * (1.82 - 0.72 * ease_out_cubic(t));
+            let alpha = (PI * t).sin().powi(2) * 0.22;
+            gizmos
+                .circle_2d(Vec2::ZERO, radius, Color::srgba(1.0, 0.62, 0.22, alpha))
+                .resolution(64);
+        }
         gizmos
             .circle_2d(
                 Vec2::ZERO,
-                radius * 0.72,
-                Color::srgba(0.82, 0.94, 1.0, alpha * 0.34),
+                horizon_radius,
+                Color::srgba(0.94, 0.80, 0.58, 0.24),
             )
             .resolution(64);
     }
@@ -677,81 +742,79 @@ fn draw_interaction_feedback(
 
     for visual in &visuals {
         match visual.phase {
-            VisualPhase::Orbiting | VisualPhase::EnteringEventHorizon => {
-                draw_orbit_trail(&mut gizmos, visual, viewport_size);
+            VisualPhase::Infalling => {
+                draw_infall_trail(&mut gizmos, visual, viewport_size, settings.lens_radius);
             }
             VisualPhase::Success => {
                 let t = normalized_time(visual.elapsed, SUCCESS_SECONDS);
-                let fade = 1.0 - smoothstep(0.18, 1.0, t);
-                for (offset, strength) in [(0.0, 0.80), (0.045, 0.48), (0.09, 0.24)] {
-                    gizmos
-                        .circle_2d(
-                            Vec2::ZERO,
-                            minimum_extent * (0.035 + offset + 0.11 * ease_out_cubic(t)),
-                            Color::srgba(1.0, 0.88, 0.62, fade * strength),
-                        )
-                        .resolution(64);
-                }
+                let fade = 1.0 - smoothstep(0.0, 1.0, t);
+                gizmos
+                    .circle_2d(
+                        Vec2::ZERO,
+                        horizon_radius * (1.02 - 0.10 * ease_out_cubic(t)),
+                        Color::srgba(0.92, 0.30, 0.06, fade * 0.14),
+                    )
+                    .resolution(64);
             }
             VisualPhase::Failure => {
                 let t = normalized_time(visual.elapsed, FAILURE_SECONDS);
                 gizmos
                     .circle_2d(
-                        visual.failure_origin,
+                        visual.failure.origin,
                         16.0 + minimum_extent * 0.10 * ease_out_cubic(t),
                         Color::srgba(1.0, 0.05, 0.03, (1.0 - t) * 0.72),
                     )
                     .resolution(48);
             }
-            VisualPhase::Attracting | VisualPhase::Capturing => {}
+            VisualPhase::Attracting
+            | VisualPhase::Capturing
+            | VisualPhase::EnteringEventHorizon => {}
         }
     }
 }
 
-fn draw_dashed_ring(gizmos: &mut Gizmos, center: Vec2, radius: f32, rotation: f32, color: Color) {
-    const SEGMENTS: usize = 20;
-    const ARC_ANGLE: f32 = TAU / SEGMENTS as f32 * 0.58;
-    for segment in 0..SEGMENTS {
-        let angle = rotation + segment as f32 * TAU / SEGMENTS as f32;
-        gizmos
-            .arc_2d(
-                Isometry2d::new(center, Rot2::radians(angle)),
-                ARC_ANGLE,
-                radius,
-                color,
-            )
-            .resolution(4);
-    }
-}
-
-fn draw_orbit_trail(gizmos: &mut Gizmos, visual: &DropVisual, viewport_size: Vec2) {
-    let mut previous = visual_sample(
+fn draw_infall_trail(
+    gizmos: &mut Gizmos,
+    visual: &DropVisual,
+    viewport_size: Vec2,
+    lens_radius: f32,
+) {
+    let current = visual_sample(
         visual.phase,
         visual.elapsed,
         visual.start_position,
-        visual.failure_origin,
-        visual.orbit_lane,
+        visual.failure,
+        visual.infall_lane,
         viewport_size,
-    )
-    .position;
-    for step in 1..=6 {
-        let earlier = (visual.elapsed - step as f32 * 0.028).max(0.0);
-        let point = visual_sample(
+        lens_radius,
+    );
+    if current.position.length() <= rendered_shadow_radius(viewport_size, lens_radius) {
+        return;
+    }
+    let mut previous = current.position;
+    for step in 1..=8 {
+        let earlier = (visual.elapsed - step as f32 * 0.024).max(0.0);
+        let earlier_sample = visual_sample(
             visual.phase,
             earlier,
             visual.start_position,
-            visual.failure_origin,
-            visual.orbit_lane,
+            visual.failure,
+            visual.infall_lane,
             viewport_size,
-        )
-        .position;
-        let alpha = 0.18 * (1.0 - step as f32 / 7.0);
-        let color = match visual.kind {
-            DropVisualKind::File => Color::srgba(0.56, 0.78, 1.0, alpha),
-            DropVisualKind::Application => Color::srgba(0.30, 1.0, 0.82, alpha),
+            lens_radius,
+        );
+        let alpha = current.alpha * 0.28 * (1.0 - step as f32 / 9.0).powi(2);
+        let base_rgb = match visual.kind {
+            DropVisualKind::File => [0.56, 0.78, 1.0],
+            DropVisualKind::Application => [0.30, 1.0, 0.82],
         };
-        gizmos.line_2d(previous, point, color);
-        previous = point;
+        let rgb = apply_gravitational_redshift(base_rgb, current.redshift);
+        gizmos.line_2d(
+            previous,
+            earlier_sample.position,
+            Color::srgba(rgb[0], rgb[1], rgb[2], alpha),
+        );
+        previous = earlier_sample.position;
     }
 }
 
@@ -759,107 +822,153 @@ fn visual_sample(
     phase: VisualPhase,
     elapsed: f32,
     start_position: Vec2,
-    failure_origin: Vec2,
-    orbit_lane: u8,
+    failure: FailureVisualState,
+    infall_lane: u8,
     viewport_size: Vec2,
+    lens_radius: f32,
 ) -> VisualSample {
     let minimum_extent = viewport_size.min_element().max(1.0);
-    let lane = (orbit_lane % 4) as f32;
+    let lane = (infall_lane % 4) as f32;
     let fallback_angle = lane * TAU / 4.0 + PI * 0.125;
-    let start_angle = if start_position.length_squared() > 1.0 {
-        start_position.y.atan2(start_position.x)
+    let release_radius = start_position.length();
+    let direction = if release_radius > f32::EPSILON {
+        start_position / release_radius
     } else {
-        fallback_angle
+        Vec2::from_angle(fallback_angle)
     };
-    let orbit_radius = minimum_extent * (0.305 - lane * 0.016);
-    let horizon_radius = minimum_extent * 0.074;
-    let capture_start_angle = start_angle - 0.18;
-    let orbit_start_angle = start_angle - 0.56;
-    let orbit_end_angle = orbit_start_angle - TAU * 1.62;
+    // The ray-traced shadow hides the geometric event horizon. Its critical-impact
+    // boundary drives visual occlusion; the wider pointer hit tolerance stays out
+    // of this geometry so the icon meets the shadow actually shown on screen.
+    let shadow_radius = rendered_shadow_radius(viewport_size, lens_radius);
+    let nominal_boundary_scale = 0.38;
+    let nominal_contact_clearance = ICON_MAX_HALF_DIAGONAL * nominal_boundary_scale;
+    let nominal_contact_radius = shadow_radius + nominal_contact_clearance;
+    let contact_ratio = (release_radius / nominal_contact_radius.max(1.0)).clamp(0.0, 1.0);
+    let boundary_scale = 0.28 + 0.10 * contact_ratio;
+    let boundary_alpha = 0.24 + 0.76 * contact_ratio;
+    let boundary_redshift = 0.96 - 0.10 * contact_ratio;
+
+    let fully_visible_radius = shadow_radius + ICON_MAX_HALF_DIAGONAL;
+    let initial_edge_gap = release_radius - fully_visible_radius;
+    let outer_edge_gap = initial_edge_gap.max(0.0);
+    let overlap_edge_gap = initial_edge_gap.min(0.0);
+    // Keep the first sample at the real release point. Fully external icons
+    // approach without crossing the shadow; icons already overlapping it keep
+    // moving inward and are clipped against the real rendered boundary.
+    let start_radius = release_radius;
+    let attraction_end_radius =
+        (shadow_radius + ICON_MAX_HALF_DIAGONAL * 0.94 + overlap_edge_gap + outer_edge_gap * 0.76)
+            .max(0.0);
+    let capture_end_radius =
+        (shadow_radius + ICON_MAX_HALF_DIAGONAL * 0.88 + overlap_edge_gap + outer_edge_gap * 0.58)
+            .max(0.0);
+    let occlusion_radius =
+        (shadow_radius + ICON_MAX_HALF_DIAGONAL * boundary_scale + overlap_edge_gap).max(0.0);
+    let contact_depth =
+        ((occlusion_radius - shadow_radius) / nominal_contact_clearance).clamp(0.0, 1.0);
+    let inner_target = occlusion_radius * 0.72;
+    let full_crossing_target = (shadow_radius - nominal_contact_clearance).max(0.0);
+    let crossing_end_radius = (inner_target
+        + (full_crossing_target - inner_target) * smoothstep(0.0, 1.0, contact_depth))
+    .clamp(0.0, occlusion_radius);
+    let attraction_span = (start_radius - attraction_end_radius).max(0.0);
+    let capture_span = (attraction_end_radius - capture_end_radius).max(0.0);
+    let capture_start_slope = if capture_span > f32::EPSILON {
+        (2.0 * attraction_span * CAPTURING_SECONDS / (ATTRACTING_SECONDS * capture_span))
+            .clamp(0.0, 3.0)
+    } else {
+        0.0
+    };
+    let attraction_end_slope = if attraction_span > f32::EPSILON {
+        capture_span * capture_start_slope * ATTRACTING_SECONDS
+            / (attraction_span * CAPTURING_SECONDS)
+    } else {
+        0.0
+    };
+    let capture_scale_start_slope = attraction_end_slope * CAPTURING_SECONDS / ATTRACTING_SECONDS;
 
     match phase {
         VisualPhase::Attracting => {
             let t = normalized_time(elapsed, ATTRACTING_SECONDS);
-            let eased = ease_out_cubic(t);
-            let destination = orbit_point(capture_start_angle, orbit_radius * 1.22);
+            let accelerated = cubic_hermite_progress(t, 0.0, attraction_end_slope);
+            let radius = start_radius + (attraction_end_radius - start_radius) * accelerated;
             VisualSample {
-                position: start_position.lerp(destination, eased),
-                scale: 1.0 - 0.08 * smoothstep(0.0, 1.0, t),
-                rotation: -0.20 * eased,
-                alpha: smoothstep(0.0, 0.18, t).max(0.36),
+                position: direction * radius,
+                scale: 1.0 - 0.06 * accelerated,
+                rotation: 0.0,
+                alpha: 1.0,
+                redshift: 0.0,
             }
         }
         VisualPhase::Capturing => {
             let t = normalized_time(elapsed, CAPTURING_SECONDS);
-            let eased = smoothstep(0.0, 1.0, t);
-            let angle = capture_start_angle + (orbit_start_angle - capture_start_angle) * eased;
-            let radius = orbit_radius * (1.22 - 0.22 * eased);
+            // Match the incoming velocity of the attraction segment and
+            // settle to zero speed for either a confirmation hold or infall.
+            let eased = cubic_hermite_progress(t, capture_start_slope, 0.0);
+            let scale_eased = cubic_hermite_progress(t, capture_scale_start_slope, 0.0);
+            let radius =
+                attraction_end_radius + (capture_end_radius - attraction_end_radius) * eased;
             VisualSample {
-                position: orbit_point(angle, radius),
-                scale: 0.92 - 0.06 * eased,
-                rotation: -0.20 - 0.48 * eased,
+                position: direction * radius,
+                scale: 0.94 - 0.06 * scale_eased,
+                rotation: 0.0,
                 alpha: 1.0,
+                redshift: 0.04 * eased,
             }
         }
-        VisualPhase::Orbiting => {
-            let t = normalized_time(elapsed, ORBITING_SECONDS);
-            let accelerated = t * (0.78 + 0.22 * t);
-            let angle = orbit_start_angle + (orbit_end_angle - orbit_start_angle) * accelerated;
-            let radius = horizon_radius + (orbit_radius - horizon_radius) * (1.0 - t).powf(1.18);
+        VisualPhase::Infalling => {
+            let t = normalized_time(elapsed, INFALLING_SECONDS);
+            // Radial speed builds through the outer field, then falls toward zero
+            // at the apparent horizon to evoke the distant-observer time delay.
+            let accelerated = smoothstep(0.0, 1.0, t.powf(1.35));
+            let radius = capture_end_radius + (occlusion_radius - capture_end_radius) * accelerated;
             VisualSample {
-                position: orbit_point(angle, radius),
-                scale: 0.86 + (0.38 - 0.86) * smoothstep(0.0, 1.0, t),
-                rotation: -0.68 - TAU * 1.95 * accelerated,
-                alpha: 1.0 - 0.12 * smoothstep(0.70, 1.0, t),
+                position: direction * radius,
+                scale: 0.88 + (boundary_scale - 0.88) * accelerated,
+                rotation: 0.0,
+                alpha: 1.0 + (boundary_alpha - 1.0) * smoothstep(0.55, 1.0, t),
+                redshift: 0.04 + (boundary_redshift - 0.04) * smoothstep(0.35, 1.0, t),
             }
         }
         VisualPhase::EnteringEventHorizon => {
             let t = normalized_time(elapsed, EVENT_HORIZON_SECONDS);
             let eased = smoothstep(0.0, 1.0, t);
-            let angle = orbit_end_angle - TAU * 0.58 * eased;
-            let radius = horizon_radius * (1.0 - eased);
+            let radius = occlusion_radius + (crossing_end_radius - occlusion_radius) * eased;
             VisualSample {
-                position: orbit_point(angle, radius),
-                scale: (0.38 * (1.0 - eased)).max(0.018),
-                rotation: -0.68 - TAU * (1.95 + 0.58 * eased),
-                alpha: 0.88 * (1.0 - smoothstep(0.08, 1.0, t)),
+                position: direction * radius,
+                scale: boundary_scale * (1.0 - 0.30 * eased),
+                rotation: 0.0,
+                alpha: boundary_alpha * (1.0 - smoothstep(0.82, 1.0, t)),
+                redshift: boundary_redshift + (1.0 - boundary_redshift) * eased,
             }
         }
         VisualPhase::Success => VisualSample {
-            position: Vec2::ZERO,
-            scale: 0.018,
+            position: direction * crossing_end_radius,
+            scale: boundary_scale * 0.70,
             rotation: 0.0,
             alpha: 0.0,
+            redshift: 1.0,
         },
         VisualPhase::Failure => {
             let t = normalized_time(elapsed, FAILURE_SECONDS);
-            let direction = if failure_origin.length_squared() > 1.0 {
-                failure_origin.normalize()
+            let direction = if failure.origin.length_squared() > 1.0 {
+                failure.origin.normalize()
             } else {
                 Vec2::from_angle(fallback_angle)
             };
             let rebound = minimum_extent * 0.24 * ease_out_back(t);
+            let recovery = smoothstep(0.0, 0.28, t);
+            let recovered_scale = failure.scale + (0.62 - failure.scale) * recovery;
+            let recovered_alpha = failure.alpha + (1.0 - failure.alpha) * recovery;
             VisualSample {
-                position: failure_origin + direction * rebound,
-                scale: 0.62 + 0.18 * (PI * t).sin(),
-                rotation: 2.4
-                    * t
-                    * if orbit_lane.is_multiple_of(2) {
-                        1.0
-                    } else {
-                        -1.0
-                    },
-                alpha: 1.0 - smoothstep(0.56, 1.0, t),
+                position: failure.origin + direction * rebound,
+                scale: recovered_scale + 0.12 * (PI * t).sin(),
+                rotation: 0.0,
+                alpha: recovered_alpha * (1.0 - smoothstep(0.56, 1.0, t)),
+                redshift: 0.0,
             }
         }
     }
-}
-
-fn orbit_point(angle: f32, radius: f32) -> Vec2 {
-    // Clockwise angular motion matches the current WGSL disk advection when
-    // viewed with the default camera. Vertical compression keeps the path on
-    // the projected accretion plane instead of looking like a flat UI circle.
-    Vec2::new(angle.cos() * radius, angle.sin() * radius * 0.43)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,7 +1012,7 @@ fn drop_target_contains(cursor: Vec2, size: Vec2, pitch: f32, lens_radius: f32) 
         1.0 - cursor.y / size.y * 2.0,
     );
     let tan_half_fov = render_tan_half_fov(lens_radius);
-    let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS / (CAMERA_DISTANCE_RS * tan_half_fov) * 1.18;
+    let shadow_radius = normalized_drop_target_shadow_radius(lens_radius);
     if screen.length_squared() <= shadow_radius * shadow_radius {
         return true;
     }
@@ -915,6 +1024,42 @@ fn drop_target_contains(cursor: Vec2, size: Vec2, pitch: f32, lens_radius: f32) 
     (screen.x / disk_major).powi(2) + (screen.y / disk_minor).powi(2) <= 1.0
 }
 
+fn normalized_rendered_shadow_radius(lens_radius: f32) -> f32 {
+    CRITICAL_IMPACT_PARAMETER_RS / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius))
+}
+
+fn normalized_drop_target_shadow_radius(lens_radius: f32) -> f32 {
+    normalized_rendered_shadow_radius(lens_radius) * SHADOW_INTERACTION_PADDING
+}
+
+fn rendered_shadow_radius(viewport_size: Vec2, lens_radius: f32) -> f32 {
+    viewport_size.y.max(1.0) * 0.5 * normalized_rendered_shadow_radius(lens_radius)
+}
+
+fn shadow_visibility(
+    parent_position: Vec2,
+    parent_scale: f32,
+    child_offset: Vec2,
+    child_size: Vec2,
+    shadow_radius: f32,
+) -> f32 {
+    let parent_radius = parent_position.length();
+    if parent_radius <= f32::EPSILON {
+        return 0.0;
+    }
+
+    let radial_direction = parent_position / parent_radius;
+    let child_center = parent_position + child_offset * parent_scale;
+    let center_radius = child_center.dot(radial_direction);
+    let half_radial_extent = 0.5
+        * parent_scale
+        * (radial_direction.x.abs() * child_size.x + radial_direction.y.abs() * child_size.y)
+            .max(0.001);
+    let outside_fraction =
+        (center_radius + half_radial_extent - shadow_radius) / (2.0 * half_radial_extent);
+    smoothstep(0.0, 1.0, outside_fraction)
+}
+
 fn normalized_time(elapsed: f32, duration: f32) -> f32 {
     (elapsed / duration).clamp(0.0, 1.0)
 }
@@ -922,6 +1067,15 @@ fn normalized_time(elapsed: f32, duration: f32) -> f32 {
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+fn cubic_hermite_progress(value: f32, start_slope: f32, end_slope: f32) -> f32 {
+    let t = value.clamp(0.0, 1.0);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let progress =
+        (-2.0 * t3 + 3.0 * t2) + start_slope * (t3 - 2.0 * t2 + t) + end_slope * (t3 - t2);
+    progress.clamp(0.0, 1.0)
 }
 
 fn ease_out_cubic(value: f32) -> f32 {
@@ -941,6 +1095,17 @@ fn mix_rgb(left: [f32; 3], right: [f32; 3], amount: f32) -> [f32; 3] {
         left[0] + (right[0] - left[0]) * amount,
         left[1] + (right[1] - left[1]) * amount,
         left[2] + (right[2] - left[2]) * amount,
+    ]
+}
+
+fn apply_gravitational_redshift(rgb: [f32; 3], amount: f32) -> [f32; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    let shifted = mix_rgb(rgb, [1.0, 0.055, 0.008], amount * 0.88);
+    let remaining_energy = 1.0 - 0.68 * amount;
+    [
+        shifted[0] * remaining_energy,
+        shifted[1] * remaining_energy,
+        shifted[2] * remaining_energy,
     ]
 }
 
@@ -991,7 +1156,7 @@ mod tests {
 
         visual.authorized = true;
         advance_visual(&mut visual, 0.001);
-        assert_eq!(visual.phase, VisualPhase::Orbiting);
+        assert_eq!(visual.phase, VisualPhase::Infalling);
     }
 
     #[test]
@@ -1000,14 +1165,15 @@ mod tests {
 
         advance_visual(&mut visual, ATTRACTING_SECONDS);
         advance_visual(&mut visual, CAPTURING_SECONDS);
-        let ready = advance_visual(&mut visual, ORBITING_SECONDS);
+        let ready = advance_visual(&mut visual, INFALLING_SECONDS);
         assert_eq!(visual.phase, VisualPhase::EnteringEventHorizon);
         assert!(visual.operation_ready_emitted);
         assert_eq!(ready.operation_ready, Some(visual.id));
 
-        advance_visual(&mut visual, EVENT_HORIZON_SECONDS * 2.0);
+        let held = advance_visual(&mut visual, EVENT_HORIZON_SECONDS * 2.0);
         assert_eq!(visual.phase, VisualPhase::EnteringEventHorizon);
         assert_eq!(visual.elapsed, 0.0);
+        assert_eq!(held.operation_ready, None);
 
         visual.operation_succeeded = true;
         advance_visual(&mut visual, EVENT_HORIZON_SECONDS);
@@ -1015,31 +1181,419 @@ mod tests {
     }
 
     #[test]
-    fn orbit_moves_clockwise_inward_and_entering_fades() {
+    fn infall_moves_radially_inward_without_spin_and_entry_fades() {
         let size = Vec2::new(900.0, 700.0);
         let start = Vec2::new(330.0, 120.0);
-        let orbit_start = visual_sample(VisualPhase::Orbiting, 0.0, start, start, 0, size);
-        let orbit_end = visual_sample(
-            VisualPhase::Orbiting,
-            ORBITING_SECONDS,
+        let lens_radius = 1.0;
+        let infall_start = visual_sample(
+            VisualPhase::Infalling,
+            0.0,
             start,
-            start,
+            failure_visual(start),
             0,
             size,
+            lens_radius,
+        );
+        let infall_end = visual_sample(
+            VisualPhase::Infalling,
+            INFALLING_SECONDS,
+            start,
+            failure_visual(start),
+            0,
+            size,
+            lens_radius,
         );
         let entering_end = visual_sample(
             VisualPhase::EnteringEventHorizon,
             EVENT_HORIZON_SECONDS,
             start,
-            start,
+            failure_visual(start),
             0,
             size,
+            lens_radius,
         );
 
-        assert!(orbit_end.position.length() < orbit_start.position.length());
-        assert!(orbit_end.rotation < orbit_start.rotation);
-        assert!(entering_end.position.length() < 0.01);
+        assert!(infall_end.position.length() < infall_start.position.length());
+        assert!(start.perp_dot(infall_end.position).abs() < 0.01);
+        assert!(start.dot(infall_end.position) > 0.0);
+        assert_eq!(infall_start.rotation, 0.0);
+        assert_eq!(infall_end.rotation, 0.0);
+        let expected_contact_radius =
+            rendered_shadow_radius(size, lens_radius) + ICON_MAX_HALF_DIAGONAL * 0.38;
+        assert!((infall_end.position.length() - expected_contact_radius).abs() < 0.01);
+        assert!(entering_end.position.length() < infall_end.position.length());
         assert_eq!(entering_end.alpha, 0.0);
+    }
+
+    #[test]
+    fn all_capture_phases_start_at_release_and_move_only_radially_inward() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let inside_shadow = Vec2::new(rendered_shadow_radius(size, lens_radius) * 0.35, 0.0);
+
+        for lane in 0..4 {
+            for start in [
+                Vec2::new(330.0, 120.0),
+                Vec2::new(-260.0, 150.0),
+                inside_shadow,
+                Vec2::ZERO,
+            ] {
+                let expected_direction = if start.length_squared() > f32::EPSILON {
+                    start.normalize()
+                } else {
+                    Vec2::from_angle((lane as f32) * TAU / 4.0 + PI * 0.125)
+                };
+                let first = visual_sample(
+                    VisualPhase::Attracting,
+                    0.0,
+                    start,
+                    failure_visual(start),
+                    lane,
+                    size,
+                    lens_radius,
+                );
+                assert!((first.position - start).length() < 0.001);
+                let mut previous_radius = start.length();
+                for (phase, duration) in [
+                    (VisualPhase::Attracting, ATTRACTING_SECONDS),
+                    (VisualPhase::Capturing, CAPTURING_SECONDS),
+                    (VisualPhase::Infalling, INFALLING_SECONDS),
+                    (VisualPhase::EnteringEventHorizon, EVENT_HORIZON_SECONDS),
+                ] {
+                    for step in 0..=32 {
+                        let sample = visual_sample(
+                            phase,
+                            duration * step as f32 / 32.0,
+                            start,
+                            failure_visual(start),
+                            lane,
+                            size,
+                            lens_radius,
+                        );
+                        let radius = sample.position.length();
+                        assert!(
+                            radius <= previous_radius + 0.001,
+                            "lane {lane}, phase {phase:?}, step {step}: {radius} > {previous_radius}"
+                        );
+                        assert_eq!(sample.rotation, 0.0);
+                        assert!(
+                            expected_direction.perp_dot(sample.position).abs() < 0.01,
+                            "lane {lane}, phase {phase:?}, step {step}: path left its radial line"
+                        );
+                        if radius > f32::EPSILON {
+                            assert!(expected_direction.dot(sample.position) > 0.0);
+                        }
+                        previous_radius = radius;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attraction_and_capture_match_position_and_scale_velocity() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let shadow_radius = rendered_shadow_radius(size, lens_radius);
+        let delta = 0.000_5;
+
+        for start in [
+            Vec2::new(330.0, 120.0),
+            Vec2::new(shadow_radius + ICON_MAX_HALF_DIAGONAL + 10.0, 0.0),
+            Vec2::new(shadow_radius * 0.8, 0.0),
+            Vec2::new(3.0, 0.0),
+            Vec2::ZERO,
+        ] {
+            let attraction_before = visual_sample(
+                VisualPhase::Attracting,
+                ATTRACTING_SECONDS - delta,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            );
+            let attraction_end = visual_sample(
+                VisualPhase::Attracting,
+                ATTRACTING_SECONDS,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            );
+            let capture_start = visual_sample(
+                VisualPhase::Capturing,
+                0.0,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            );
+            let capture_after = visual_sample(
+                VisualPhase::Capturing,
+                delta,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            );
+
+            assert!((attraction_end.position - capture_start.position).length() < 0.001);
+            assert!((attraction_end.scale - capture_start.scale).abs() < f32::EPSILON);
+            let attraction_position_rate =
+                (attraction_end.position.length() - attraction_before.position.length()) / delta;
+            let capture_position_rate =
+                (capture_after.position.length() - capture_start.position.length()) / delta;
+            let attraction_scale_rate = (attraction_end.scale - attraction_before.scale) / delta;
+            let capture_scale_rate = (capture_after.scale - capture_start.scale) / delta;
+            assert!((attraction_position_rate - capture_position_rate).abs() < 2.0);
+            assert!((attraction_scale_rate - capture_scale_rate).abs() < 0.02);
+        }
+    }
+
+    #[test]
+    fn icon_inner_edge_stays_outside_the_shadow_before_success() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let shadow_radius = rendered_shadow_radius(size, lens_radius);
+
+        for lane in 0..4 {
+            for start in [
+                Vec2::new(330.0, 120.0),
+                Vec2::new(shadow_radius + ICON_MAX_HALF_DIAGONAL + 1.0, 0.0),
+                Vec2::new(-(shadow_radius + ICON_MAX_HALF_DIAGONAL + 24.0), 18.0),
+            ] {
+                for (phase, duration) in [
+                    (VisualPhase::Attracting, ATTRACTING_SECONDS),
+                    (VisualPhase::Capturing, CAPTURING_SECONDS),
+                    (VisualPhase::Infalling, INFALLING_SECONDS),
+                ] {
+                    for step in 0..=64 {
+                        let sample = visual_sample(
+                            phase,
+                            duration * step as f32 / 64.0,
+                            start,
+                            failure_visual(start),
+                            lane,
+                            size,
+                            lens_radius,
+                        );
+                        let inner_edge =
+                            sample.position.length() - ICON_MAX_HALF_DIAGONAL * sample.scale;
+                        assert!(
+                            inner_edge + 0.001 >= shadow_radius,
+                            "lane {lane}, phase {phase:?}, step {step}: {inner_edge} < {shadow_radius}"
+                        );
+                    }
+                }
+
+                let waiting = visual_sample(
+                    VisualPhase::EnteringEventHorizon,
+                    0.0,
+                    start,
+                    failure_visual(start),
+                    lane,
+                    size,
+                    lens_radius,
+                );
+                let waiting_inner_edge =
+                    waiting.position.length() - ICON_MAX_HALF_DIAGONAL * waiting.scale;
+                assert!(waiting_inner_edge + 0.001 >= shadow_radius);
+            }
+        }
+    }
+
+    #[test]
+    fn horizon_crossing_occludes_once_and_never_reappears() {
+        let size = Vec2::new(900.0, 700.0);
+        let start = Vec2::new(280.0, -130.0);
+        let lens_radius = 1.0;
+        let boundary = visual_sample(
+            VisualPhase::EnteringEventHorizon,
+            0.0,
+            start,
+            failure_visual(start),
+            0,
+            size,
+            lens_radius,
+        );
+        let mut previous_alpha = boundary.alpha;
+
+        assert!(boundary.alpha > 0.0);
+        for step in 1..=32 {
+            let sample = visual_sample(
+                VisualPhase::EnteringEventHorizon,
+                EVENT_HORIZON_SECONDS * step as f32 / 32.0,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            );
+            assert!(sample.alpha <= previous_alpha + f32::EPSILON);
+            previous_alpha = sample.alpha;
+        }
+
+        let success = visual_sample(
+            VisualPhase::Success,
+            SUCCESS_SECONDS,
+            start,
+            failure_visual(start),
+            0,
+            size,
+            lens_radius,
+        );
+        assert_eq!(previous_alpha, 0.0);
+        assert_eq!(success.alpha, 0.0);
+    }
+
+    #[test]
+    fn a_release_inside_the_shadow_waits_for_success_before_crossing() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let start = Vec2::new(rendered_shadow_radius(size, lens_radius) * 0.35, 0.0);
+        let mut visual = test_visual(true);
+        visual.start_position = start;
+        visual.failure = failure_visual(start);
+
+        advance_visual(&mut visual, ATTRACTING_SECONDS);
+        advance_visual(&mut visual, CAPTURING_SECONDS);
+        let ready = advance_visual(&mut visual, INFALLING_SECONDS);
+        assert_eq!(ready.operation_ready, Some(visual.id));
+        assert_eq!(visual.phase, VisualPhase::EnteringEventHorizon);
+
+        let boundary = visual_sample(
+            visual.phase,
+            visual.elapsed,
+            visual.start_position,
+            visual.failure,
+            visual.infall_lane,
+            size,
+            lens_radius,
+        );
+        advance_visual(&mut visual, EVENT_HORIZON_SECONDS * 2.0);
+        let held = visual_sample(
+            visual.phase,
+            visual.elapsed,
+            visual.start_position,
+            visual.failure,
+            visual.infall_lane,
+            size,
+            lens_radius,
+        );
+
+        assert_eq!(visual.phase, VisualPhase::EnteringEventHorizon);
+        assert_eq!(visual.elapsed, 0.0);
+        assert!((held.position - boundary.position).length() < 0.001);
+        assert_eq!(held.alpha, boundary.alpha);
+
+        visual.operation_succeeded = true;
+        advance_visual(&mut visual, EVENT_HORIZON_SECONDS);
+        let success = visual_sample(
+            visual.phase,
+            visual.elapsed,
+            visual.start_position,
+            visual.failure,
+            visual.infall_lane,
+            size,
+            lens_radius,
+        );
+        assert_eq!(visual.phase, VisualPhase::Success);
+        assert!(success.position.length() <= boundary.position.length());
+        assert_eq!(success.alpha, 0.0);
+    }
+
+    #[test]
+    fn success_is_accepted_only_after_the_visual_reaches_the_boundary() {
+        let mut visual = test_visual(true);
+
+        assert!(!can_accept_operation_success(&visual));
+        visual.phase = VisualPhase::EnteringEventHorizon;
+        assert!(!can_accept_operation_success(&visual));
+        visual.operation_ready_emitted = true;
+        assert!(can_accept_operation_success(&visual));
+        visual.phase = VisualPhase::Attracting;
+        assert!(!can_accept_operation_success(&visual));
+    }
+
+    #[test]
+    fn releases_on_either_side_of_the_shadow_have_continuous_infall() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let shadow = rendered_shadow_radius(size, lens_radius);
+        let sample_at = |radius: f32| {
+            let start = Vec2::new(radius, 0.0);
+            visual_sample(
+                VisualPhase::Infalling,
+                INFALLING_SECONDS,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                lens_radius,
+            )
+        };
+
+        let just_inside = sample_at(shadow - 0.5);
+        let just_outside = sample_at(shadow + 0.5);
+
+        assert!((just_inside.position.length() - just_outside.position.length()).abs() < 2.0);
+        assert!((just_inside.scale - just_outside.scale).abs() < 0.01);
+        assert!((just_inside.alpha - just_outside.alpha).abs() < 0.02);
+    }
+
+    #[test]
+    fn horizon_occlusion_progresses_across_each_icon_part() {
+        let shadow_radius = 80.0;
+        let scale = 0.4;
+        let size = Vec2::splat(50.0);
+
+        let outside =
+            shadow_visibility(Vec2::new(90.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
+        let straddling =
+            shadow_visibility(Vec2::new(80.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
+        let inside =
+            shadow_visibility(Vec2::new(70.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
+
+        assert_eq!(outside, 1.0);
+        assert!((straddling - 0.5).abs() < f32::EPSILON);
+        assert_eq!(inside, 0.0);
+    }
+
+    #[test]
+    fn failure_feedback_starts_from_the_last_visible_scale_and_alpha() {
+        let failure = FailureVisualState {
+            origin: Vec2::new(90.0, 20.0),
+            scale: 0.83,
+            alpha: 0.47,
+        };
+        let sample = visual_sample(
+            VisualPhase::Failure,
+            0.0,
+            failure.origin,
+            failure,
+            0,
+            Vec2::new(900.0, 700.0),
+            1.0,
+        );
+
+        assert!((sample.scale - failure.scale).abs() < f32::EPSILON);
+        assert!((sample.alpha - failure.alpha).abs() < f32::EPSILON);
+        assert_eq!(sample.position, failure.origin);
+    }
+
+    #[test]
+    fn phase_overshoot_is_carried_into_the_next_motion_segment() {
+        let mut visual = test_visual(true);
+        visual.elapsed = ATTRACTING_SECONDS - 0.02;
+
+        advance_visual(&mut visual, 0.10);
+
+        assert_eq!(visual.phase, VisualPhase::Capturing);
+        assert!((visual.elapsed - 0.08).abs() < 0.000_01);
     }
 
     #[test]
@@ -1062,11 +1616,19 @@ mod tests {
             phase: VisualPhase::Attracting,
             elapsed: 0.0,
             start_position: Vec2::new(200.0, 100.0),
-            failure_origin: Vec2::new(200.0, 100.0),
-            orbit_lane: 0,
+            failure: failure_visual(Vec2::new(200.0, 100.0)),
+            infall_lane: 0,
             authorized,
             operation_ready_emitted: false,
             operation_succeeded: false,
+        }
+    }
+
+    fn failure_visual(origin: Vec2) -> FailureVisualState {
+        FailureVisualState {
+            origin,
+            scale: 1.0,
+            alpha: 1.0,
         }
     }
 }
