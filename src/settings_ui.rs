@@ -14,7 +14,7 @@ use bevy::{
 use bevy_egui::{EguiContext, EguiGlobalSettings, EguiMultipassSchedule, EguiPlugin, egui};
 
 use crate::desktop_capture::DesktopCaptureState;
-use crate::settings::{AntiAliasingMode, BlackHoleSettings, RenderQuality};
+use crate::settings::{AntiAliasingMode, BlackHoleSettings, FrameRateLimit, RenderQuality};
 
 #[cfg(target_os = "windows")]
 #[path = "system_tray.rs"]
@@ -33,6 +33,7 @@ pub(crate) struct UninstallPrompt {
     pub application_name: String,
     pub publisher: Option<String>,
     pub install_location: Option<PathBuf>,
+    pub uninstall_source: String,
     pub source_path: PathBuf,
 }
 
@@ -363,7 +364,6 @@ fn toggle_settings_window(
             hide_settings_window(&mut window, &mut pending, &mut file_actions);
         } else {
             file_actions.cancel_pending_uninstall();
-            window.set_minimized(false);
             window.visible = true;
             pending.0 = true;
         }
@@ -378,7 +378,6 @@ fn hide_settings_window(
     file_actions: &mut FileActionUiState,
 ) {
     file_actions.cancel_pending_uninstall();
-    window.set_minimized(false);
     window.visible = false;
     window.focused = false;
     pending.0 = false;
@@ -396,7 +395,6 @@ fn show_requested_settings_window(
     let Ok(mut window) = windows.single_mut() else {
         return;
     };
-    window.set_minimized(false);
     window.visible = true;
     // `apply_pending_focus` already ran this frame. The next frame focuses the
     // now-visible native HWND after winit has applied the visibility change.
@@ -594,6 +592,9 @@ fn uninstall_confirmation_modal(context: &egui::Context, state: &mut FileActionU
                 );
             }
             ui.add(
+                egui::Label::new(format!("卸载来源：{}", prompt.uninstall_source)).wrap(),
+            );
+            ui.add(
                 egui::Label::new(format!("拖入来源：{}", prompt.source_path.display())).wrap(),
             );
             ui.add_space(8.0);
@@ -726,6 +727,19 @@ fn display_tab(
 }
 
 fn quality_tab(ui: &mut egui::Ui, settings: &mut BlackHoleSettings) {
+    section_heading(ui, "帧率");
+    egui::ComboBox::from_label("帧率上限")
+        .selected_text(settings.frame_rate_limit.label())
+        .show_ui(ui, |ui| {
+            for limit in FrameRateLimit::ALL {
+                ui.selectable_value(&mut settings.frame_rate_limit, limit, limit.label());
+            }
+        });
+    setting_description(
+        ui,
+        "限制黑洞动画、拖放交互和渲染的更新频率。30 FPS 更省电，60 FPS 适合日常使用，120 FPS 需要更高性能。",
+    );
+
     section_heading(ui, "光线积分");
     egui::ComboBox::from_label("渲染质量")
         .selected_text(settings.render_quality.label())
@@ -889,6 +903,7 @@ mod tests {
             application_name: "Example".to_owned(),
             publisher: None,
             install_location: None,
+            uninstall_source: r"C:\Program Files\Example\uninstall.exe".to_owned(),
             source_path: PathBuf::from(r"C:\Desktop\Example.lnk"),
         }
     }

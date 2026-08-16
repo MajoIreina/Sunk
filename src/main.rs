@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::{thread, time::Instant};
+
 mod black_hole;
 mod desktop_capture;
 mod file_interaction;
@@ -16,7 +18,11 @@ use bevy::{
         RenderPlugin,
         settings::{Backends, WgpuSettings},
     },
-    window::{CompositeAlphaMode, MonitorSelection, WindowLevel, WindowPosition, WindowResolution},
+    time::TimeSystems,
+    window::{
+        CompositeAlphaMode, MonitorSelection, PresentMode, WindowLevel, WindowPosition,
+        WindowResolution,
+    },
     winit::WinitSettings,
 };
 use bevy_egui::EguiPlugin;
@@ -25,8 +31,15 @@ use black_hole::BlackHolePlugin;
 use desktop_capture::DesktopCapturePlugin;
 use file_interaction::FileInteractionPlugin;
 use file_workflow::FileWorkflowPlugin;
+use settings::{BlackHoleSettings, FrameRateLimit};
 use settings_ui::SettingsUiPlugin;
 use window_interaction::WindowInteractionPlugin;
+
+#[derive(Resource, Default)]
+struct FramePacer {
+    deadline: Option<Instant>,
+    limit: FrameRateLimit,
+}
 
 fn main() {
     configure_windows_transparency();
@@ -50,6 +63,9 @@ fn main() {
                         // User-driven edge resizing would break that composition.
                         resizable: false,
                         window_level: WindowLevel::AlwaysOnTop,
+                        // The frame pacer selects 30/60/120 FPS while VSync keeps
+                        // the transparent desktop composition free of tearing.
+                        present_mode: PresentMode::AutoVsync,
                         #[cfg(target_os = "windows")]
                         composite_alpha_mode: CompositeAlphaMode::PreMultiplied,
                         // Keep the DComp Visual HWND in the normal taskbar class.
@@ -76,7 +92,41 @@ fn main() {
             FileWorkflowPlugin,
             WindowInteractionPlugin,
         ))
+        .init_resource::<FramePacer>()
+        .add_systems(First, pace_frames.before(TimeSystems))
         .run();
+}
+
+fn pace_frames(settings: Res<BlackHoleSettings>, mut pacer: ResMut<FramePacer>) {
+    let interval = settings.frame_rate_limit.frame_time();
+    let now = Instant::now();
+
+    if pacer.limit != settings.frame_rate_limit {
+        pacer.limit = settings.frame_rate_limit;
+        pacer.deadline = None;
+    }
+
+    let Some(deadline) = pacer.deadline else {
+        pacer.deadline = Some(now + interval);
+        return;
+    };
+
+    if deadline > now {
+        thread::sleep(deadline - now);
+    }
+
+    let after_wait = Instant::now();
+    if after_wait.saturating_duration_since(deadline) > interval.saturating_mul(4) {
+        // Resume from suspend/debugger pauses without trying to replay frames.
+        pacer.deadline = Some(after_wait + interval);
+        return;
+    }
+
+    let mut next = deadline + interval;
+    while next <= after_wait {
+        next += interval;
+    }
+    pacer.deadline = Some(next);
 }
 
 #[cfg(target_os = "windows")]

@@ -11,6 +11,7 @@ struct BlackHoleUniform {
     desktop: vec4<f32>,
     desktop_uv_origin_scale: vec4<f32>,
     sample: vec4<f32>,
+    drag_feedback: vec4<f32>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0)
@@ -128,6 +129,19 @@ fn animation_time() -> f32 {
     return max(params.viewport_time_fov.z, 0.0);
 }
 
+fn co_rotating_disk_domain(
+    radius: f32,
+    advected_phi: f32,
+    layer_coordinate: f32,
+    inner: f32,
+) -> vec2<f32> {
+    let orbital_direction = vec2<f32>(cos(advected_phi), sin(advected_phi));
+    let log_radius = log(max(radius / inner, 0.36));
+    return orbital_direction * radius * 0.82
+        + vec2<f32>(0.68, -0.43) * log_radius
+        + vec2<f32>(0.31, -0.24) * layer_coordinate;
+}
+
 fn radial_window(radius: f32) -> f32 {
     let inner = max(params.disk.x, 1.01);
     let outer = max(params.disk.y, inner + 0.1);
@@ -171,27 +185,23 @@ fn disk_cloud_pattern(position: vec3<f32>, radius: f32) -> DiskCloudPattern {
     // past the photosphere instead of looking like an extruded 2-D texture.
     let layer_angular_scale = 1.0 + 0.038 * layer_coordinate;
     let advected_phi = phi - flow_time * omega * layer_angular_scale;
-    let log_radius = log(max(radius / inner, 0.36));
-
     // Build the domain from a co-rotating Cartesian point. Unlike sampling phi
     // directly, this remains continuous across the atan2 seam. Integer-armed
     // spiral phases below are periodic at the same seam as well.
-    let orbital_direction = vec2<f32>(cos(advected_phi), sin(advected_phi));
-    var domain = orbital_direction * radius * 0.82;
-    domain += vec2<f32>(0.68, -0.43) * log_radius;
-    domain += vec2<f32>(0.31, -0.24) * layer_coordinate;
+    let domain = co_rotating_disk_domain(radius, advected_phi, layer_coordinate, inner);
 
     // Low-frequency vector noise bends the higher-frequency cloud field. This
     // domain warp is what changes soft blobs into connected rolling filaments.
     let warp_domain = rotate_and_scale(domain, 0.34);
+    let shared_macro = value_noise(warp_domain + vec2<f32>(12.7, -4.3));
     let warp = vec2<f32>(
-        value_noise(warp_domain + vec2<f32>(12.7, -4.3)),
+        shared_macro,
         value_noise(rotate_and_scale(warp_domain, 1.07) + vec2<f32>(-8.1, 15.9)),
     ) * 2.0 - vec2<f32>(1.0);
     let warp_strength = mix(0.22, 1.35, turbulence) * mix(0.4, 1.0, cloudiness);
     let warped_domain = domain + warp * warp_strength;
 
-    let macro_cloud = cloud_fbm(warped_domain * 0.72);
+    let macro_cloud = mix(shared_macro, cloud_fbm(warped_domain * 0.72), 0.78);
     let detail0 = value_noise(
         rotate_and_scale(warped_domain, 1.91)
             + vec2<f32>(17.2, -9.4)
@@ -285,10 +295,14 @@ fn disk_volume_pattern(position: vec3<f32>, radius: f32) -> DiskCloudPattern {
     let omega = sqrt(0.5 / max(radius * radius * radius, 1.0e-5));
     let advected_phi = phi
         - animation_time() * params.disk.w * omega * (1.0 + 0.038 * layer_coordinate);
-    let orbital_direction = vec2<f32>(cos(advected_phi), sin(advected_phi));
-    let domain = orbital_direction * radius * 0.58
-        + vec2<f32>(0.27, -0.19) * layer_coordinate;
-    let macro_cloud = value_noise(domain * 0.78 + vec2<f32>(4.7, -8.2));
+    let domain = co_rotating_disk_domain(radius, advected_phi, layer_coordinate, inner);
+    let warp_domain = rotate_and_scale(domain, 0.34);
+    let shared_macro = value_noise(warp_domain + vec2<f32>(12.7, -4.3));
+    let macro_cloud = mix(
+        shared_macro,
+        value_noise(domain * 0.78 + vec2<f32>(4.7, -8.2)),
+        0.34,
+    );
     let detail = value_noise(
         rotate_and_scale(domain, 1.83) + vec2<f32>(-11.4, 6.8),
     );
@@ -407,7 +421,7 @@ fn blackbody_chroma(kelvin: f32) -> vec3<f32> {
     return rgb;
 }
 
-fn observed_frequency_shift(radius: f32, photon_lambda: f32, observer_radius: f32) -> f32 {
+fn circular_frequency_shift(radius: f32, photon_lambda: f32, observer_radius: f32) -> f32 {
     // g = nu_observed / nu_emitted for a circular Schwarzschild emitter and a
     // static finite-radius observer. photon_lambda is L_axis/E for the physical
     // photon; the renderer traces the opposite direction, hence its sign is fixed
@@ -417,6 +431,34 @@ fn observed_frequency_shift(radius: f32, photon_lambda: f32, observer_radius: f3
     let observer_clock = sqrt(max(1.0 - 1.0 / max(observer_radius, 1.001), 1.0e-5));
     let longitudinal = max(1.0 - omega * photon_lambda, 0.05);
     return clamp(emitter_clock / (observer_clock * longitudinal), 0.08, 4.0);
+}
+
+fn observed_frequency_shift(radius: f32, photon_lambda: f32, observer_radius: f32) -> f32 {
+    let inner = max(params.disk.x, 1.51);
+    let horizon = max(params.integration.x, 1.0);
+    let transition_inner = max(horizon * 1.12, inner - max(0.25, inner * 0.12));
+    let orbit_radius = max(radius, transition_inner);
+    let circular = circular_frequency_shift(orbit_radius, photon_lambda, observer_radius);
+    if radius >= inner {
+        return circular;
+    }
+
+    // Material inside the ISCO is no longer on a stable circular orbit. Match
+    // the circular solution exactly at the ISCO, then use the Schwarzschild
+    // lapse and a modest radial-infall Doppler term so radiation approaches zero
+    // continuously at the horizon. Smoothstep has zero endpoint derivatives,
+    // making both joins C1 rather than a visible brightness/color kink.
+    let inner_shift = circular_frequency_shift(inner, photon_lambda, observer_radius);
+    let safe_radius = max(radius, horizon + 1.0e-4);
+    let lapse_ratio = sqrt(clamp(
+        (1.0 - horizon / safe_radius) / max(1.0 - horizon / inner, 1.0e-4),
+        0.0,
+        1.0,
+    ));
+    let plunge_progress = 1.0 - smoothstep(horizon * 1.035, inner, radius);
+    let plunge = inner_shift * lapse_ratio * (1.0 - 0.34 * plunge_progress);
+    let circular_blend = smoothstep(transition_inner, inner, radius);
+    return clamp(mix(plunge, circular, circular_blend), 0.01, 4.0);
 }
 
 fn source_radiance(
@@ -942,26 +984,9 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         // Subtract the finite-plane projection of the original straight ray. The
         // remaining vector is the displacement produced by the integrated
         // geodesic itself, independent of camera projection conventions.
-        let deflection_uv = projection.uv - unbent_projection.uv;
-        let warped_uv = uv + deflection_uv * warp_amount;
-        let mapping = params.desktop_uv_origin_scale;
-        let captured_uv = mapping.xy + warped_uv * mapping.zw;
-        let capture_size = vec2<f32>(textureDimensions(desktop_texture));
-        let capture_edge_pixels = min(
-            min(captured_uv.x * capture_size.x, (1.0 - captured_uv.x) * capture_size.x),
-            min(captured_uv.y * capture_size.y, (1.0 - captured_uv.y) * capture_size.y),
-        );
-        let capture_coverage = smoothstep(0.35, 2.0, capture_edge_pixels);
-        let desktop_color = textureSampleLevel(
-            desktop_texture,
-            desktop_sampler,
-            clamp(captured_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
-            0.0,
-        ).rgb;
-
-        let warp_pixels = length(
-            (warped_uv - uv) * max(params.viewport_time_fov.xy, vec2<f32>(1.0)),
-        );
+        let raw_deflection_uv = projection.uv - unbent_projection.uv;
+        let viewport_size = max(params.viewport_time_fov.xy, vec2<f32>(1.0));
+        let raw_warp_pixels = length(raw_deflection_uv * warp_amount * viewport_size);
         let critical_impact = sqrt(CRITICAL_IMPACT_PARAMETER_SQUARED);
         let normalized_impact = critical_impact
             / max(ray.impact_parameter, critical_impact);
@@ -1003,13 +1028,6 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
         );
         let far_field_fade = 1.0 - smoothstep(0.62, 1.0, influence_coordinate);
 
-        // Ignore imperceptible subpixel motion, then compress large deflections
-        // smoothly instead of making every escaped ray fully opaque. Closest
-        // approach and excess path length retain the nonlinear critical-orbit
-        // response, including rays that form higher-order images.
-        let visible_displacement = smoothstep(0.18, 2.25, warp_pixels);
-        let perceptual_displacement = 1.0 - exp(-0.58 * warp_pixels);
-        let displacement_response = visible_displacement * perceptual_displacement;
         let critical_response = impact_response * (0.55 + 0.45 * impact_response);
         let winding_response = 1.0
             - (1.0 - closest_response) * (1.0 - path_response);
@@ -1018,8 +1036,105 @@ fn shade_sample(uv: vec2<f32>) -> vec4<f32> {
             0.0,
             1.0,
         );
-        let lens_mask = displacement_response * physical_confidence * far_field_fade
-            * projection.coverage * unbent_projection.coverage * capture_coverage;
+        let raw_visible_displacement = smoothstep(0.18, 2.25, raw_warp_pixels);
+        let raw_perceptual_displacement = 1.0 - exp(-0.58 * raw_warp_pixels);
+        let raw_displacement_response = raw_visible_displacement
+            * raw_perceptual_displacement;
+        let ray_support = clamp(
+            raw_displacement_response * physical_confidence * far_field_fade
+                * projection.coverage * unbent_projection.coverage,
+            0.0,
+            1.0,
+        );
+
+        // Explorer owns the native drag thumbnail, so the renderer cannot bend
+        // those pixels directly. A short, geodesically occluded tidal echo in
+        // the desktop capture shows radial stretching toward the hole without
+        // introducing the angular motion of the accretion disk.
+        let cursor_pixels = params.drag_feedback.xy * viewport_size;
+        let fragment_pixels = uv * viewport_size;
+        let cursor_to_hole = viewport_size * 0.5 - cursor_pixels;
+        let inward = cursor_to_hole / max(length(cursor_to_hole), 1.0);
+        let tangent = vec2<f32>(-inward.y, inward.x);
+        let relative = fragment_pixels - cursor_pixels;
+        let along = dot(relative, inward);
+        let across = dot(relative, tangent);
+        let drag_influence = clamp(params.drag_feedback.z, 0.0, 1.0);
+        let wake_length = mix(34.0, 148.0, drag_influence);
+        let wake_width = mix(8.0, 22.0, drag_influence);
+        let longitudinal_gate = smoothstep(-10.0, 4.0, along)
+            * (1.0 - smoothstep(wake_length * 0.56, wake_length, along));
+        let transverse_gate = exp(-pow(across / max(wake_width, 1.0), 2.0));
+        let core_coordinate = vec2<f32>(
+            along / max(wake_width * 1.45, 1.0),
+            across / max(wake_width, 1.0),
+        );
+        let local_core = exp(-dot(core_coordinate, core_coordinate));
+        let tidal_mask = drag_influence * clamp(
+            local_core * 0.38 + longitudinal_gate * transverse_gate * 0.72,
+            0.0,
+            1.0,
+        );
+        let target_response = mix(
+            0.92,
+            1.08,
+            clamp(params.drag_feedback.w, 0.0, 1.0),
+        );
+        let tidal_shift_uv = inward * tidal_mask
+            * mix(0.8, 5.2, drag_influence) * target_response / viewport_size;
+
+        // Displacement and coverage share one support value. At the far field
+        // the sampled desktop coordinate now returns smoothly to the unwarped
+        // pixel instead of leaving a low-alpha duplicate image.
+        let tentative_deflection = (raw_deflection_uv * warp_amount + tidal_shift_uv)
+            * ray_support;
+        let mapping = params.desktop_uv_origin_scale;
+        let capture_size = vec2<f32>(textureDimensions(desktop_texture));
+        let base_capture_uv = mapping.xy + uv * mapping.zw;
+        let base_edge_pixels = min(
+            min(
+                base_capture_uv.x * capture_size.x,
+                (1.0 - base_capture_uv.x) * capture_size.x,
+            ),
+            min(
+                base_capture_uv.y * capture_size.y,
+                (1.0 - base_capture_uv.y) * capture_size.y,
+            ),
+        );
+        let tentative_capture_uv = mapping.xy + (uv + tentative_deflection) * mapping.zw;
+        let tentative_edge_pixels = min(
+            min(
+                tentative_capture_uv.x * capture_size.x,
+                (1.0 - tentative_capture_uv.x) * capture_size.x,
+            ),
+            min(
+                tentative_capture_uv.y * capture_size.y,
+                (1.0 - tentative_capture_uv.y) * capture_size.y,
+            ),
+        );
+        // C1 capture support prevents large near-critical deflections from
+        // turning insufficient overscan into a sharp transparent boundary.
+        let capture_support = smoothstep(0.5, 16.0, base_edge_pixels)
+            * smoothstep(-32.0, 16.0, tentative_edge_pixels);
+        let unified_support = ray_support * capture_support;
+        let warped_uv = uv
+            + (raw_deflection_uv * warp_amount + tidal_shift_uv) * unified_support;
+        let captured_uv = mapping.xy + warped_uv * mapping.zw;
+        let capture_edge_pixels = min(
+            min(captured_uv.x * capture_size.x, (1.0 - captured_uv.x) * capture_size.x),
+            min(captured_uv.y * capture_size.y, (1.0 - captured_uv.y) * capture_size.y),
+        );
+        let capture_coverage = smoothstep(0.0, 6.0, capture_edge_pixels);
+        let desktop_color = textureSampleLevel(
+            desktop_texture,
+            desktop_sampler,
+            clamp(captured_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+            0.0,
+        ).rgb;
+
+        // Drag feedback changes the same desktop sample coordinate as gravity;
+        // it must not add a second alpha layer or expose delayed unwarped pixels.
+        let lens_mask = unified_support * capture_coverage;
         premultiplied_rgb += ray.transmittance * desktop_color * lens_mask;
         alpha += ray.transmittance * lens_mask;
     }

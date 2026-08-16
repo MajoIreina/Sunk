@@ -15,8 +15,21 @@ impl Plugin for DesktopCapturePlugin {
 
         #[cfg(target_os = "windows")]
         app.add_systems(PreStartup, windows_backend::start_capture)
-            .add_systems(Update, windows_backend::upload_latest_frame);
+            .add_systems(
+                Update,
+                (
+                    windows_backend::upload_latest_frame,
+                    windows_backend::sync_capture_mapping,
+                )
+                    .chain()
+                    .in_set(DesktopCaptureSystems::Sync),
+            );
     }
+}
+
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DesktopCaptureSystems {
+    Sync,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -33,6 +46,8 @@ pub struct DesktopCaptureState {
     pub texture: Option<Handle<Image>>,
     /// Maps window-local UV into the captured desktop texture: origin.xy, scale.xy.
     pub uv_origin_scale: Vec4,
+    /// Absolute physical-pixel origin of the texture on the virtual desktop.
+    pub capture_origin: IVec2,
     /// Physical size of the overscanned capture texture, not the overlay window.
     pub frame_size: UVec2,
     pub frame_index: u64,
@@ -48,6 +63,7 @@ impl Default for DesktopCaptureState {
             },
             texture: None,
             uv_origin_scale: Vec4::new(0.0, 0.0, 1.0, 1.0),
+            capture_origin: IVec2::ZERO,
             frame_size: UVec2::ZERO,
             frame_index: 0,
         }
@@ -105,7 +121,7 @@ mod windows_backend {
     use super::DesktopCaptureState;
 
     const WINDOW_TITLE: &str = "Sunk Black Hole";
-    const CAPTURE_INTERVAL: Duration = Duration::from_millis(50);
+    const CAPTURE_INTERVAL: Duration = Duration::from_nanos(33_333_333);
     const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
     const OVERSCAN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
     const MAX_CAPTURE_DIMENSION: i32 = 4_096;
@@ -114,7 +130,7 @@ mod windows_backend {
     struct CapturedFrame {
         size: UVec2,
         rgba: Vec<u8>,
-        uv_origin_scale: Vec4,
+        capture_origin: IVec2,
         index: u64,
     }
 
@@ -263,7 +279,35 @@ mod windows_backend {
 
         state.frame_size = frame.size;
         state.frame_index = frame.index;
-        state.uv_origin_scale = frame.uv_origin_scale;
+        state.capture_origin = frame.capture_origin;
+    }
+
+    /// The texture covers a fixed absolute desktop rectangle until the next GDI
+    /// frame arrives. Recompute the moving overlay's sub-rectangle every render
+    /// frame so window motion does not inherit the capture thread's latency.
+    pub(super) fn sync_capture_mapping(
+        mut state: ResMut<DesktopCaptureState>,
+        mut cached_hwnd: Local<usize>,
+    ) {
+        if state.frame_size == UVec2::ZERO {
+            return;
+        }
+
+        let hwnd = cached_primary_hwnd(&mut cached_hwnd);
+        let Some(hwnd) = hwnd else {
+            return;
+        };
+        let Ok(client_rect) = client_rect_in_screen(hwnd) else {
+            *cached_hwnd = 0;
+            return;
+        };
+        let capture_rect = ScreenRect {
+            left: state.capture_origin.x,
+            top: state.capture_origin.y,
+            right: state.capture_origin.x + state.frame_size.x as i32,
+            bottom: state.capture_origin.y + state.frame_size.y as i32,
+        };
+        state.uv_origin_scale = window_uv_mapping(client_rect, capture_rect);
     }
 
     fn capture_loop(latest: Arc<Mutex<Option<CapturedFrame>>>, running: Arc<AtomicBool>) {
@@ -293,7 +337,7 @@ mod windows_backend {
             }
         }
         info!(
-            "desktop capture proof enabled at 20 FPS (GDI CPU upload, {:.0}% overscan)",
+            "desktop capture proof enabled at 30 FPS (GDI CPU upload, {:.0}% overscan)",
             OVERSCAN_FRACTION * 100.0
         );
         // Do not apply display affinity to the opaque settings HWND. GDI BitBlt
@@ -315,7 +359,7 @@ mod windows_backend {
             };
 
             match capture_window(geometry, &mut capture_policy) {
-                Ok((size, rgba, uv_origin_scale)) => {
+                Ok((size, rgba, capture_origin)) => {
                     if capture_failure.take().is_some() {
                         info!("desktop capture recovered");
                     }
@@ -324,7 +368,7 @@ mod windows_backend {
                         *slot = Some(CapturedFrame {
                             size,
                             rgba,
-                            uv_origin_scale,
+                            capture_origin,
                             index: frame_index,
                         });
                     }
@@ -345,11 +389,31 @@ mod windows_backend {
         // SAFETY: `title` is a NUL-terminated UTF-16 string for the duration of
         // this call. A null class name asks Windows to match by title.
         let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }.ok()?;
+        belongs_to_current_process(hwnd).then_some(hwnd)
+    }
+
+    fn cached_primary_hwnd(cached: &mut usize) -> Option<HWND> {
+        if *cached != 0 {
+            let hwnd = HWND(*cached as *mut c_void);
+            if belongs_to_current_process(hwnd) {
+                return Some(hwnd);
+            }
+            *cached = 0;
+        }
+
+        let title = encode_window_title(WINDOW_TITLE);
+        let hwnd = find_owned_window(&title)?;
+        *cached = hwnd.0 as usize;
+        Some(hwnd)
+    }
+
+    fn belongs_to_current_process(hwnd: HWND) -> bool {
         let mut owner_pid = 0_u32;
-        // SAFETY: `owner_pid` is writable and `hwnd` is the title match above.
+        // SAFETY: `owner_pid` is writable and querying an invalid stale HWND
+        // simply returns a zero thread id.
         let owner_thread =
             unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid as *mut u32)) };
-        (owner_thread != 0 && owner_pid == std::process::id()).then_some(hwnd)
+        owner_thread != 0 && owner_pid == std::process::id()
     }
 
     fn exclude_window(
@@ -431,13 +495,13 @@ mod windows_backend {
     fn capture_window(
         geometry: CaptureGeometry,
         policy: &mut CapturePolicy,
-    ) -> Result<(UVec2, Vec<u8>, Vec4), String> {
+    ) -> Result<(UVec2, Vec<u8>, IVec2), String> {
         let now = Instant::now();
         let try_overscan =
             policy.mode == CaptureRegionMode::Overscan || now >= policy.retry_overscan_at;
 
         if try_overscan {
-            match capture_source_rect(geometry.client_rect, geometry.capture_rect) {
+            match capture_source_rect(geometry.capture_rect) {
                 Ok(frame) => {
                     if policy.mode == CaptureRegionMode::ClientOnly {
                         info!("desktop capture restored monitor-local overscan");
@@ -458,7 +522,7 @@ mod windows_backend {
                                 "monitor-local overscan failed ({overscan_error}); client rectangle does not intersect its nearest monitor"
                             )
                         })?;
-                    match capture_source_rect(geometry.client_rect, client_capture) {
+                    match capture_source_rect(client_capture) {
                         Ok(frame) => {
                             if was_overscanned {
                                 warn!(
@@ -481,13 +545,10 @@ mod windows_backend {
             .client_rect
             .intersection(geometry.monitor_rect)
             .ok_or("client rectangle does not intersect its nearest monitor")?;
-        capture_source_rect(geometry.client_rect, client_capture)
+        capture_source_rect(client_capture)
     }
 
-    fn capture_source_rect(
-        client_rect: ScreenRect,
-        capture_rect: ScreenRect,
-    ) -> Result<(UVec2, Vec<u8>, Vec4), String> {
+    fn capture_source_rect(capture_rect: ScreenRect) -> Result<(UVec2, Vec<u8>, IVec2), String> {
         // SAFETY: All GDI handles are checked before use, the DIB length exactly
         // matches width*height*4, and every acquired handle is released below.
         let (size, rgba) = unsafe {
@@ -498,7 +559,7 @@ mod windows_backend {
                 capture_rect.height(),
             )
         }?;
-        Ok((size, rgba, window_uv_mapping(client_rect, capture_rect)))
+        Ok((size, rgba, IVec2::new(capture_rect.left, capture_rect.top)))
     }
 
     fn client_rect_in_screen(hwnd: HWND) -> Result<ScreenRect, String> {
@@ -791,6 +852,26 @@ mod windows_backend {
                 capture.top as f32 + (mapping.y + mapping.w) * capture.height() as f32,
                 client.bottom as f32,
             );
+        }
+
+        #[test]
+        fn uv_mapping_tracks_window_motion_inside_one_captured_frame() {
+            let capture = rect(-1_920, 0, 1_710, 1_330);
+            let before = rect(-1_800, 100, 900, 700);
+            let after = rect(-1_620, 175, 900, 700);
+            let before_mapping = window_uv_mapping(before, capture);
+            let after_mapping = window_uv_mapping(after, capture);
+
+            assert_close(
+                (after_mapping.x - before_mapping.x) * capture.width() as f32,
+                180.0,
+            );
+            assert_close(
+                (after_mapping.y - before_mapping.y) * capture.height() as f32,
+                75.0,
+            );
+            assert_close(after_mapping.z, before_mapping.z);
+            assert_close(after_mapping.w, before_mapping.w);
         }
     }
 }

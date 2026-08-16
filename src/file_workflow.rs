@@ -15,7 +15,8 @@ use crate::{
     },
     file_operations::{
         DropAnalysis, FileOperationCommand, FileOperationError, FileOperationErrorKind,
-        FileOperationResult, FileOperationsWorker, UninstallCandidate, normalize_windows_path,
+        FileOperationResult, FileOperationsWorker, UninstallCandidate, UninstallLaunchPlan,
+        normalize_windows_path,
     },
     settings_ui::{
         FileActionStatusKind, FileActionUiState, ShowSettingsWindow, UninstallDecision,
@@ -133,7 +134,6 @@ struct FileWorkflowState {
     analysis_batches: HashMap<u64, PendingAnalysisBatch>,
     request_batches: HashMap<u64, u64>,
     operations: HashMap<u64, PendingOperation>,
-    revalidations: HashMap<u64, u64>,
     pending_uninstall_prompt: Option<u64>,
     backend_failed: bool,
 }
@@ -146,7 +146,6 @@ impl Default for FileWorkflowState {
             analysis_batches: HashMap::new(),
             request_batches: HashMap::new(),
             operations: HashMap::new(),
-            revalidations: HashMap::new(),
             pending_uninstall_prompt: None,
             backend_failed: false,
         }
@@ -195,20 +194,14 @@ struct PendingOperation {
 
 #[derive(Debug)]
 enum OperationIntent {
-    Trash {
-        path: PathBuf,
-    },
-    Uninstall {
-        source_path: PathBuf,
-        candidate: Box<UninstallCandidate>,
-    },
+    Trash { path: PathBuf },
+    Uninstall { candidate: Box<UninstallCandidate> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationPhase {
     AwaitingConfirmation,
     Animating,
-    Revalidating,
     Submitted,
 }
 
@@ -405,18 +398,6 @@ fn poll_worker_results(
     for result in results {
         match result {
             FileOperationResult::DropAnalyzed { request_id, result } => {
-                if let Some(visual_id) = state.revalidations.remove(&request_id) {
-                    finish_uninstall_revalidation(
-                        visual_id,
-                        result,
-                        &backend,
-                        &mut state,
-                        &mut ui,
-                        &mut visuals,
-                    );
-                    continue;
-                }
-
                 let Some(batch_id) = state.request_batches.remove(&request_id) else {
                     continue;
                 };
@@ -598,16 +579,21 @@ fn finalize_analyzed_batches(
                     application_name: candidate.entry.display_name.clone(),
                     publisher: candidate.entry.publisher.clone(),
                     install_location: candidate.entry.install_location.clone(),
+                    uninstall_source: match &candidate.launch_plan {
+                        UninstallLaunchPlan::Msi { product_code } => {
+                            format!("Windows Installer {product_code}")
+                        }
+                        UninstallLaunchPlan::Exe { executable, .. } => {
+                            executable.display().to_string()
+                        }
+                    },
                     source_path: item.path.clone(),
                 };
                 state.pending_uninstall_prompt = Some(item.id);
                 state.operations.insert(
                     item.id,
                     PendingOperation {
-                        intent: OperationIntent::Uninstall {
-                            source_path: item.path,
-                            candidate,
-                        },
+                        intent: OperationIntent::Uninstall { candidate },
                         phase: OperationPhase::AwaitingConfirmation,
                     },
                 );
@@ -620,7 +606,7 @@ fn finalize_analyzed_batches(
                 ui.set_status(
                     FileActionStatusKind::Warning,
                     "等待卸载确认",
-                    "已找到唯一的高置信软件记录。确认前不会启动任何程序，也不会删除快捷方式。",
+                    "已匹配 Windows 中登记的软件记录。确认前不会启动卸载程序，也不会删除快捷方式。",
                 );
                 show_settings.write(ShowSettingsWindow);
             }
@@ -660,7 +646,7 @@ fn handle_uninstall_decision(
             ui.set_status(
                 FileActionStatusKind::Information,
                 "卸载已确认",
-                "软件图标正在进入事件视界；启动前会再次核对 Windows 中的卸载记录。",
+                "软件图标正在进入事件视界；到达操作边界后将直接启动刚才确认的卸载程序。",
             );
         }
         DecisionOutcome::InvalidState(id) => {
@@ -685,8 +671,8 @@ fn handle_visual_operation_ready(
         let action = state.operations.get(&event.id).and_then(|operation| {
             (operation.phase == OperationPhase::Animating).then(|| match &operation.intent {
                 OperationIntent::Trash { path } => ReadyAction::Trash(path.clone()),
-                OperationIntent::Uninstall { source_path, .. } => {
-                    ReadyAction::Revalidate(source_path.clone())
+                OperationIntent::Uninstall { candidate } => {
+                    ReadyAction::Uninstall(candidate.clone())
                 }
             })
         });
@@ -706,28 +692,15 @@ fn handle_visual_operation_ready(
                     operation.phase = OperationPhase::Submitted;
                 }
             }
-            ReadyAction::Revalidate(source_path) => {
-                let Some(revalidation_id) = state.allocate_id() else {
-                    fail_operation(
-                        event.id,
-                        "内部请求编号已耗尽".to_owned(),
-                        &mut state,
-                        &mut ui,
-                        &mut visuals,
-                    );
-                    continue;
-                };
-                let command = FileOperationCommand::AnalyzeDrop {
-                    request_id: revalidation_id,
-                    path: source_path,
+            ReadyAction::Uninstall(candidate) => {
+                let command = FileOperationCommand::LaunchUninstall {
+                    request_id: event.id,
+                    candidate,
                 };
                 if let Err(error) = backend.send(command) {
                     fail_operation(event.id, error, &mut state, &mut ui, &mut visuals);
-                } else {
-                    state.revalidations.insert(revalidation_id, event.id);
-                    if let Some(operation) = state.operations.get_mut(&event.id) {
-                        operation.phase = OperationPhase::Revalidating;
-                    }
+                } else if let Some(operation) = state.operations.get_mut(&event.id) {
+                    operation.phase = OperationPhase::Submitted;
                 }
             }
         }
@@ -737,68 +710,7 @@ fn handle_visual_operation_ready(
 #[derive(Debug)]
 enum ReadyAction {
     Trash(PathBuf),
-    Revalidate(PathBuf),
-}
-
-fn finish_uninstall_revalidation(
-    visual_id: u64,
-    result: Result<DropAnalysis, FileOperationError>,
-    backend: &FileOperationsBackend,
-    state: &mut FileWorkflowState,
-    ui: &mut FileActionUiState,
-    visuals: &mut MessageWriter<VisualCommand>,
-) {
-    let expected = state.operations.get(&visual_id).and_then(|operation| {
-        if operation.phase != OperationPhase::Revalidating {
-            return None;
-        }
-        match &operation.intent {
-            OperationIntent::Uninstall { candidate, .. } => Some(candidate.clone()),
-            OperationIntent::Trash { .. } => None,
-        }
-    });
-    let Some(expected) = expected else {
-        return;
-    };
-
-    let current = match result {
-        Ok(DropAnalysis::Uninstall(candidate)) if candidate == expected => candidate,
-        Ok(DropAnalysis::Uninstall(_)) => {
-            fail_operation(
-                visual_id,
-                "确认后软件的卸载记录发生了变化".to_owned(),
-                state,
-                ui,
-                visuals,
-            );
-            return;
-        }
-        Ok(DropAnalysis::Trashable(_)) => {
-            fail_operation(
-                visual_id,
-                "拖入目标不再对应同一个软件".to_owned(),
-                state,
-                ui,
-                visuals,
-            );
-            return;
-        }
-        Err(error) => {
-            error!("uninstall revalidation failed: {error}");
-            fail_operation(visual_id, analysis_error_detail(&error), state, ui, visuals);
-            return;
-        }
-    };
-
-    let command = FileOperationCommand::LaunchUninstall {
-        request_id: visual_id,
-        candidate: current,
-    };
-    if let Err(error) = backend.send(command) {
-        fail_operation(visual_id, error, state, ui, visuals);
-    } else if let Some(operation) = state.operations.get_mut(&visual_id) {
-        operation.phase = OperationPhase::Submitted;
-    }
+    Uninstall(Box<UninstallCandidate>),
 }
 
 fn analysis_mix(batch: &PendingAnalysisBatch) -> AnalysisMix {
@@ -953,7 +865,6 @@ fn fail_operation(
     visuals: &mut MessageWriter<VisualCommand>,
 ) {
     state.operations.remove(&id);
-    state.revalidations.retain(|_, visual_id| *visual_id != id);
     if state.pending_uninstall_prompt == Some(id) {
         state.pending_uninstall_prompt = None;
         ui.dismiss_prompt(id);
@@ -983,7 +894,6 @@ fn fail_all_work(
         reject_items(state, ids, paths, batch.drop_position, visuals);
     }
     state.request_batches.clear();
-    state.revalidations.clear();
 
     let operations = std::mem::take(&mut state.operations);
     for (id, operation) in operations {
@@ -1041,10 +951,7 @@ fn analysis_error_detail(error: &FileOperationError) -> String {
             "无法读取 Windows 中登记的软件卸载信息。".to_owned()
         }
         FileOperationErrorKind::NoUninstallCandidate => {
-            "没有找到唯一且高置信的 Windows 卸载记录，未执行任何操作。".to_owned()
-        }
-        FileOperationErrorKind::AmbiguousUninstallCandidate => {
-            "找到多个可能的软件记录，无法安全确定卸载对象。".to_owned()
+            "没有找到与该图标匹配的 Windows 卸载记录，未执行任何操作。".to_owned()
         }
         FileOperationErrorKind::UnsafeUninstallCommand => {
             "软件登记的卸载入口不符合安全启动规则。".to_owned()
@@ -1119,7 +1026,6 @@ mod tests {
             id,
             PendingOperation {
                 intent: OperationIntent::Uninstall {
-                    source_path: PathBuf::from(r"C:\Desktop\Example.lnk"),
                     candidate: uninstall_candidate(),
                 },
                 phase: OperationPhase::AwaitingConfirmation,

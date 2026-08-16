@@ -5,45 +5,57 @@
 //! Bevy's non-Send storage makes every system that touches it run on the main
 //! thread.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bevy::{app::AppExit, prelude::*};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
 use windows::{
-    Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId, IsIconic},
+    Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        UI::{
+            Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+            WindowsAndMessaging::{
+                FindWindowW, GetWindowThreadProcessId, IsIconic, IsWindow, SC_MINIMIZE,
+                SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, ShowWindow, WM_SIZE, WM_SYSCOMMAND,
+            },
+        },
+    },
     core::PCWSTR,
 };
 
-use super::{PendingSettingsFocus, SETTINGS_WINDOW_TITLE, SettingsWindow, toggle_settings_window};
+use super::{PendingSettingsFocus, SETTINGS_WINDOW_TITLE, SettingsWindow, hide_settings_on_close};
 
 const TRAY_ICON_ID: &str = "sunk-system-tray";
 const SHOW_MENU_ID: &str = "sunk-show-settings";
 const QUIT_MENU_ID: &str = "sunk-quit";
+const SETTINGS_SUBCLASS_ID: usize = 0x5355_4E4B;
 
 pub(super) struct SystemTrayPlugin;
 
 impl Plugin for SystemTrayPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, initialize_system_tray)
-            .add_systems(
-                Update,
-                (
-                    hide_minimized_settings,
-                    poll_system_tray.after(toggle_settings_window),
-                ),
-            );
+            .add_systems(Update, poll_system_tray.after(hide_settings_on_close));
     }
 }
 
-/// Non-Send because both `TrayIcon` and its `muda` menu contain `Rc` handles.
 struct SystemTrayState {
+    tray_ui: Option<TrayUi>,
+    settings_hwnd: Option<HWND>,
+    native_hide_requested: &'static AtomicBool,
+}
+
+/// Non-Send because both `TrayIcon` and its `muda` menu contain `Rc` handles.
+struct TrayUi {
     icon: TrayIcon,
     show_id: MenuId,
     quit_id: MenuId,
 }
 
-impl SystemTrayState {
+impl TrayUi {
     fn create() -> Result<Self, String> {
         let show = MenuItem::with_id(SHOW_MENU_ID, "显示设置", true, None);
         let separator = PredefinedMenuItem::separator();
@@ -71,83 +83,185 @@ impl SystemTrayState {
     }
 }
 
+impl SystemTrayState {
+    fn create() -> Self {
+        let tray_ui = match TrayUi::create() {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                error!("Windows system tray unavailable: {error}");
+                None
+            }
+        };
+
+        Self {
+            tray_ui,
+            settings_hwnd: None,
+            // The callback may outlive normal ECS teardown if Windows has
+            // already started destroying HWNDs. One process-lifetime atomic is
+            // intentionally leaked so dwRefData can never become dangling.
+            native_hide_requested: Box::leak(Box::new(AtomicBool::new(false))),
+        }
+    }
+
+    fn install_settings_subclass(&mut self) {
+        if let Some(hwnd) = self.settings_hwnd {
+            // SAFETY: IsWindow only queries the cached opaque handle.
+            if unsafe { IsWindow(Some(hwnd)).as_bool() } {
+                return;
+            }
+            self.settings_hwnd = None;
+        }
+        let Some(hwnd) = find_settings_hwnd() else {
+            return;
+        };
+        let state = self.native_hide_requested as *const AtomicBool as usize;
+        // SAFETY: The callback pointer and subclass id stay constant, and state
+        // has process lifetime. This system runs on the window event-loop thread.
+        if unsafe {
+            SetWindowSubclass(
+                hwnd,
+                Some(settings_window_subclass),
+                SETTINGS_SUBCLASS_ID,
+                state,
+            )
+        }
+        .as_bool()
+        {
+            self.settings_hwnd = Some(hwnd);
+        } else {
+            warn!("could not intercept settings-window minimize messages");
+        }
+    }
+
+    fn restore_settings_window(&mut self) {
+        self.install_settings_subclass();
+        let Some(hwnd) = self.settings_hwnd else {
+            return;
+        };
+        // Restore explicitly only for fallback paths that became iconic before
+        // the subclass was installed. Normally hidden windows are shown through
+        // Bevy below, avoiding a synchronous native show before a rendered frame.
+        // SAFETY: The cached HWND was validated by install_settings_subclass.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+        }
+    }
+}
+
 impl Drop for SystemTrayState {
     fn drop(&mut self) {
-        // Hide immediately during shutdown; dropping `TrayIcon` directly after
-        // this issues NIM_DELETE and destroys its hidden Win32 message window.
-        let _ = self.icon.set_visible(false);
+        if let Some(hwnd) = self.settings_hwnd.take() {
+            // SAFETY: This uses the same HWND, callback and id passed to
+            // SetWindowSubclass, and runs on the main thread that installed it.
+            unsafe {
+                let _ = RemoveWindowSubclass(
+                    hwnd,
+                    Some(settings_window_subclass),
+                    SETTINGS_SUBCLASS_ID,
+                );
+            }
+        }
+        if let Some(tray) = self.tray_ui.as_ref() {
+            // Hide immediately during shutdown; dropping `TrayIcon` directly
+            // after this issues NIM_DELETE and destroys its hidden message window.
+            let _ = tray.icon.set_visible(false);
+        }
     }
+}
+
+/// Consume minimize before it reaches winit/wgpu. DX12 otherwise starts a
+/// zero-sized surface reconfiguration while the next Bevy frame tries to
+/// restore and hide the same HWND, which can fail ResizeBuffers fatally.
+unsafe extern "system" fn settings_window_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    state: usize,
+) -> LRESULT {
+    let minimize_command = message == WM_SYSCOMMAND && (wparam.0 as u32 & 0xFFF0) == SC_MINIMIZE;
+    let minimized_size = message == WM_SIZE && wparam.0 as u32 == SIZE_MINIMIZED;
+    if minimize_command || minimized_size {
+        // SAFETY: `state` points to the process-lifetime AtomicBool installed above.
+        let hidden = unsafe { &*(state as *const AtomicBool) };
+        hidden.store(true, Ordering::Release);
+        // SAFETY: `hwnd` is the window currently dispatching this message.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        return LRESULT(0);
+    }
+
+    // SAFETY: Every message not explicitly consumed must continue through the
+    // comctl32 subclass chain.
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 /// Startup is an exclusive system, so creation occurs on the winit/main thread
 /// after the native event loop has started. The value stays in non-Send storage
 /// for the same-thread lifetime required by `tray-icon` on Windows.
 fn initialize_system_tray(world: &mut World) {
-    match SystemTrayState::create() {
-        Ok(tray) => world.insert_non_send(tray),
-        Err(error) => error!("Windows system tray unavailable: {error}"),
-    }
-}
-
-/// Winit does not expose a portable minimized-state getter. On Windows,
-/// `IsIconic` is the authoritative check; hiding the Bevy window removes its
-/// taskbar button while the persistent notification-area icon remains.
-fn hide_minimized_settings(
-    mut pending: ResMut<PendingSettingsFocus>,
-    mut settings_window: Query<&mut Window, With<SettingsWindow>>,
-) {
-    let Ok(mut window) = settings_window.single_mut() else {
-        return;
-    };
-    if !window.visible || !settings_window_is_minimized() {
-        return;
-    }
-
-    // Clear the native iconic state before hiding. This guarantees a later
-    // tray restore returns to a normal window instead of a hidden minimized one.
-    window.set_minimized(false);
-    window.visible = false;
-    window.focused = false;
-    pending.0 = false;
+    // Always install the minimize guard. Tray creation is best effort and must
+    // not decide whether minimizing the settings surface is process-safe.
+    world.insert_non_send(SystemTrayState::create());
 }
 
 fn poll_system_tray(
-    tray: Option<NonSend<SystemTrayState>>,
+    tray: Option<NonSendMut<SystemTrayState>>,
     mut pending: ResMut<PendingSettingsFocus>,
     mut settings_window: Query<&mut Window, With<SettingsWindow>>,
     mut app_exit: MessageWriter<AppExit>,
 ) {
-    let Some(tray) = tray else {
+    let Some(mut tray) = tray else {
         return;
     };
+
+    tray.install_settings_subclass();
+
+    let native_hidden = tray.native_hide_requested.swap(false, Ordering::AcqRel);
+    if native_hidden {
+        let Ok(mut window) = settings_window.single_mut() else {
+            return;
+        };
+        // The HWND is already hidden. Updating Bevy's mirror once keeps Egui
+        // and rendering asleep without issuing the minimize/restore sequence.
+        window.visible = false;
+        window.focused = false;
+        pending.0 = false;
+    }
 
     let mut show_requested = false;
     let mut quit_requested = false;
 
-    for event in TrayIconEvent::receiver().try_iter() {
-        if event.id() != tray.icon.id() {
-            continue;
-        }
-        if matches!(
-            event,
-            TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } | TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
+    if let Some(tray_ui) = tray.tray_ui.as_ref() {
+        for event in TrayIconEvent::receiver().try_iter() {
+            if event.id() != tray_ui.icon.id() {
+                continue;
             }
-        ) {
-            show_requested = true;
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                show_requested = true;
+            }
         }
-    }
 
-    for event in MenuEvent::receiver().try_iter() {
-        if event.id == tray.show_id {
-            show_requested = true;
-        } else if event.id == tray.quit_id {
-            quit_requested = true;
+        for event in MenuEvent::receiver().try_iter() {
+            if event.id == tray_ui.show_id {
+                show_requested = true;
+            } else if event.id == tray_ui.quit_id {
+                quit_requested = true;
+            }
         }
     }
 
@@ -157,10 +271,10 @@ fn poll_system_tray(
     }
 
     if show_requested {
+        tray.restore_settings_window();
         let Ok(mut window) = settings_window.single_mut() else {
             return;
         };
-        window.set_minimized(false);
         window.visible = true;
         // `poll_system_tray` is ordered after the keyboard toggle, whose chain
         // starts with `apply_pending_focus`. Focus is therefore requested on the
@@ -169,26 +283,22 @@ fn poll_system_tray(
     }
 }
 
-fn settings_window_is_minimized() -> bool {
+fn find_settings_hwnd() -> Option<HWND> {
     let title: Vec<u16> = SETTINGS_WINDOW_TITLE
         .encode_utf16()
         .chain(Some(0))
         .collect();
     // SAFETY: `title` is NUL-terminated and valid for this call. A null class
     // name asks Windows to match only the window title.
-    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }) else {
-        return false;
-    };
+    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }.ok()?;
 
     let mut process_id = 0_u32;
     // SAFETY: `process_id` is writable and `hwnd` came from FindWindowW.
     let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     if thread_id == 0 || process_id != std::process::id() {
-        return false;
+        return None;
     }
-
-    // SAFETY: The HWND was found above and belongs to this process.
-    unsafe { IsIconic(hwnd).as_bool() }
+    Some(hwnd)
 }
 
 fn make_black_hole_icon() -> Result<Icon, String> {

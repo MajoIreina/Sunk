@@ -33,11 +33,13 @@ const SUCCESS_SECONDS: f32 = 0.120;
 const FAILURE_SECONDS: f32 = 0.680;
 const INVALID_DROP_PULSE_SECONDS: f32 = 0.520;
 const VISUAL_Z: f32 = 100.0;
+#[cfg(test)]
 const ICON_MAX_HALF_DIAGONAL: f32 = 42.0;
 
 const CAMERA_DISTANCE_RS: f32 = 30.0;
 const DISK_OUTER_RADIUS_RS: f32 = 11.5;
 const CRITICAL_IMPACT_PARAMETER_RS: f32 = 2.598_076;
+const BACKGROUND_INFLUENCE_SHADOW_RADII: f32 = 3.45;
 const DISK_LENSING_PADDING: f32 = 1.10;
 const SHADOW_INTERACTION_PADDING: f32 = 1.18;
 
@@ -145,6 +147,10 @@ impl Plugin for FileInteractionPlugin {
 pub(crate) struct DropInteractionState {
     pub(crate) drag_active: bool,
     pub(crate) hovering_black_hole: bool,
+    /// Window-local texture coordinate of the native OLE cursor.
+    pub(crate) feedback_uv: Vec2,
+    /// Physical lens falloff at the cursor, zero outside the influence range.
+    pub(crate) influence_strength: f32,
     queued_visuals: VecDeque<QueuedVisual>,
     active_ids: HashSet<DropVisualId>,
     next_visual_spawn_at: f64,
@@ -183,13 +189,15 @@ struct DropVisual {
 #[derive(Debug, Clone, Copy)]
 struct FailureVisualState {
     origin: Vec2,
-    scale: f32,
+    radial_scale: f32,
+    tangential_scale: f32,
     alpha: f32,
 }
 
 #[derive(Component, Debug, Clone, Copy)]
 struct DropVisualPart {
     size: Vec2,
+    local_translation: Vec3,
     base_rgb: [f32; 3],
     base_alpha: f32,
 }
@@ -207,8 +215,9 @@ enum VisualPhase {
 #[derive(Debug, Clone, Copy)]
 struct VisualSample {
     position: Vec2,
-    scale: f32,
-    rotation: f32,
+    radial_direction: Vec2,
+    radial_scale: f32,
+    tangential_scale: f32,
     alpha: f32,
     redshift: f32,
 }
@@ -230,6 +239,12 @@ fn observe_primary_file_drag(
     let (primary_entity, window) = *primary_window;
     let cursor_sample = primary_cursor_sample(window, &mut overlay_runtime);
     let cursor_position = cursor_sample.map(|sample| sample.position);
+    let cursor_feedback = cursor_sample.map(|sample| {
+        (
+            sample.position / sample.client_size,
+            drag_lens_influence_strength(sample.position, sample.client_size, settings.lens_radius),
+        )
+    });
     let cursor_over_target = cursor_sample.is_some_and(|sample| {
         drop_target_contains(
             sample.position,
@@ -270,6 +285,7 @@ fn observe_primary_file_drag(
         let paths = collect_drop_batch(dropped);
         state.drag_active = false;
         state.hovering_black_hole = false;
+        state.influence_strength = 0.0;
 
         if cursor_over_target
             && let Some(drop_position) = drop_world_position
@@ -291,11 +307,22 @@ fn observe_primary_file_drag(
     if canceled {
         state.drag_active = false;
         state.hovering_black_hole = false;
+        state.influence_strength = 0.0;
     } else {
         if hovered {
             state.drag_active = true;
         }
         state.hovering_black_hole = state.drag_active && cursor_over_target;
+        if state.drag_active {
+            if let Some((feedback_uv, influence_strength)) = cursor_feedback {
+                state.feedback_uv = feedback_uv;
+                state.influence_strength = influence_strength;
+            } else {
+                state.influence_strength = 0.0;
+            }
+        } else {
+            state.influence_strength = 0.0;
+        }
     }
 }
 
@@ -427,7 +454,8 @@ fn spawn_visual(commands: &mut Commands, queued: QueuedVisual, infall_lane: u8) 
                 start_position: queued.start_position,
                 failure: FailureVisualState {
                     origin: queued.start_position,
-                    scale: 1.0,
+                    radial_scale: 1.0,
+                    tangential_scale: 1.0,
                     alpha: 1.0,
                 },
                 infall_lane,
@@ -452,12 +480,13 @@ fn spawn_file_icon(parent: &mut ChildSpawnerCommands) {
         [0.50, 0.72, 1.0],
         0.16,
     );
-    spawn_icon_part(
+    spawn_icon_grid(
         parent,
         Vec2::new(38.0, 48.0),
         Vec3::new(0.0, 0.0, 0.1),
         [0.86, 0.94, 1.0],
         0.96,
+        UVec2::splat(4),
     );
     spawn_icon_part(
         parent,
@@ -490,12 +519,13 @@ fn spawn_application_icon(parent: &mut ChildSpawnerCommands) {
         [0.30, 0.96, 0.84],
         0.18,
     );
-    spawn_icon_part(
+    spawn_icon_grid(
         parent,
         Vec2::new(43.0, 43.0),
         Vec3::new(0.0, 0.0, 0.1),
         [0.16, 0.68, 0.74],
         0.98,
+        UVec2::splat(4),
     );
     for (x, y) in [(-10.0, 10.0), (10.0, 10.0), (-10.0, -10.0), (10.0, -10.0)] {
         spawn_icon_part(
@@ -523,10 +553,36 @@ fn spawn_icon_part(
         Transform::from_translation(translation),
         DropVisualPart {
             size,
+            local_translation: translation,
             base_rgb,
             base_alpha,
         },
     ));
+}
+
+fn spawn_icon_grid(
+    parent: &mut ChildSpawnerCommands,
+    size: Vec2,
+    translation: Vec3,
+    base_rgb: [f32; 3],
+    base_alpha: f32,
+    subdivisions: UVec2,
+) {
+    let subdivisions = subdivisions.max(UVec2::ONE);
+    let cell_size = size / subdivisions.as_vec2();
+    let lower_left = -size * 0.5 + cell_size * 0.5;
+    for y in 0..subdivisions.y {
+        for x in 0..subdivisions.x {
+            let cell_offset = lower_left + Vec2::new(x as f32, y as f32) * cell_size;
+            spawn_icon_part(
+                parent,
+                cell_size,
+                translation + cell_offset.extend(0.0),
+                base_rgb,
+                base_alpha,
+            );
+        }
+    }
 }
 
 #[allow(
@@ -540,7 +596,7 @@ fn animate_visuals(
     settings: Res<BlackHoleSettings>,
     mut state: ResMut<DropInteractionState>,
     mut visuals: Query<(Entity, &mut DropVisual, &mut Transform, &Children)>,
-    mut parts: Query<(&DropVisualPart, &Transform, &mut Sprite), Without<DropVisual>>,
+    mut parts: Query<(&DropVisualPart, &mut Transform, &mut Sprite), Without<DropVisual>>,
     mut operation_ready: MessageWriter<VisualOperationReady>,
 ) {
     let delta = time.delta_secs().min(0.1);
@@ -563,23 +619,38 @@ fn animate_visuals(
             visual.elapsed,
             visual.start_position,
             visual.failure,
+            visual.kind,
             visual.infall_lane,
             viewport_size,
             settings.lens_radius,
         );
 
         transform.translation = sample.position.extend(VISUAL_Z);
-        transform.rotation = Quat::from_rotation_z(sample.rotation);
-        transform.scale = Vec3::splat(sample.scale.max(0.001));
+        let radial_angle = sample.radial_direction.y.atan2(sample.radial_direction.x);
+        transform.rotation = Quat::from_rotation_z(radial_angle);
+        transform.scale = Vec3::new(
+            sample.radial_scale.max(0.001),
+            sample.tangential_scale.max(0.001),
+            1.0,
+        );
 
         let failure = visual.phase == VisualPhase::Failure;
         if !failure {
-            visual.failure.scale = sample.scale;
+            visual.failure.radial_scale = sample.radial_scale;
+            visual.failure.tangential_scale = sample.tangential_scale;
             visual.failure.alpha = sample.alpha;
         }
         let shadow_radius = rendered_shadow_radius(viewport_size, settings.lens_radius);
         for child in children.iter() {
-            if let Ok((part, child_transform, mut sprite)) = parts.get_mut(child) {
+            if let Ok((part, mut child_transform, mut sprite)) = parts.get_mut(child) {
+                // The parent axes follow the radial/tangential field. Counter-rotate
+                // each part so an isotropic sample preserves the original icon
+                // orientation while anisotropic samples produce tidal shear only.
+                let local_xy = rotate_2d(part.local_translation.truncate(), -radial_angle);
+                child_transform.translation = local_xy.extend(part.local_translation.z);
+                child_transform.rotation = Quat::from_rotation_z(-radial_angle);
+                child_transform.scale = Vec3::ONE;
+
                 let rgb = if failure {
                     mix_rgb(part.base_rgb, [1.0, 0.12, 0.08], 0.82)
                 } else {
@@ -587,8 +658,9 @@ fn animate_visuals(
                 };
                 let geometric_visibility = shadow_visibility(
                     sample.position,
-                    sample.scale,
-                    child_transform.translation.truncate(),
+                    sample.radial_direction,
+                    sample.radial_scale,
+                    part.local_translation.truncate(),
                     part.size,
                     shadow_radius,
                 );
@@ -784,6 +856,7 @@ fn draw_infall_trail(
         visual.elapsed,
         visual.start_position,
         visual.failure,
+        visual.kind,
         visual.infall_lane,
         viewport_size,
         lens_radius,
@@ -799,6 +872,7 @@ fn draw_infall_trail(
             earlier,
             visual.start_position,
             visual.failure,
+            visual.kind,
             visual.infall_lane,
             viewport_size,
             lens_radius,
@@ -818,11 +892,16 @@ fn draw_infall_trail(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pure sampler combines lifecycle, icon geometry, and viewport projection inputs"
+)]
 fn visual_sample(
     phase: VisualPhase,
     elapsed: f32,
     start_position: Vec2,
     failure: FailureVisualState,
+    kind: DropVisualKind,
     infall_lane: u8,
     viewport_size: Vec2,
     lens_radius: f32,
@@ -836,19 +915,20 @@ fn visual_sample(
     } else {
         Vec2::from_angle(fallback_angle)
     };
+    let icon_half_extent = icon_radial_half_extent(kind, direction);
     // The ray-traced shadow hides the geometric event horizon. Its critical-impact
     // boundary drives visual occlusion; the wider pointer hit tolerance stays out
     // of this geometry so the icon meets the shadow actually shown on screen.
     let shadow_radius = rendered_shadow_radius(viewport_size, lens_radius);
-    let nominal_boundary_scale = 0.38;
-    let nominal_contact_clearance = ICON_MAX_HALF_DIAGONAL * nominal_boundary_scale;
-    let nominal_contact_radius = shadow_radius + nominal_contact_clearance;
-    let contact_ratio = (release_radius / nominal_contact_radius.max(1.0)).clamp(0.0, 1.0);
-    let boundary_scale = 0.28 + 0.10 * contact_ratio;
+    let fully_visible_radius = shadow_radius + icon_half_extent;
+    let contact_ratio = (release_radius / fully_visible_radius.max(1.0)).clamp(0.0, 1.0);
+    // Preserve radial size while compressing the tangential axis. The icon is
+    // swallowed by the shadow mask instead of uniformly shrinking into a point.
+    let boundary_base_scale = 0.50 + 0.08 * contact_ratio;
+    let (boundary_radial_scale, boundary_tangential_scale) = tidal_scales(boundary_base_scale, 1.0);
     let boundary_alpha = 0.24 + 0.76 * contact_ratio;
     let boundary_redshift = 0.96 - 0.10 * contact_ratio;
 
-    let fully_visible_radius = shadow_radius + ICON_MAX_HALF_DIAGONAL;
     let initial_edge_gap = release_radius - fully_visible_radius;
     let outer_edge_gap = initial_edge_gap.max(0.0);
     let overlap_edge_gap = initial_edge_gap.min(0.0);
@@ -857,20 +937,17 @@ fn visual_sample(
     // moving inward and are clipped against the real rendered boundary.
     let start_radius = release_radius;
     let attraction_end_radius =
-        (shadow_radius + ICON_MAX_HALF_DIAGONAL * 0.94 + overlap_edge_gap + outer_edge_gap * 0.76)
+        (shadow_radius + icon_half_extent * 0.94 + overlap_edge_gap + outer_edge_gap * 0.76)
             .max(0.0);
     let capture_end_radius =
-        (shadow_radius + ICON_MAX_HALF_DIAGONAL * 0.88 + overlap_edge_gap + outer_edge_gap * 0.58)
+        (shadow_radius + icon_half_extent * 0.88 + overlap_edge_gap + outer_edge_gap * 0.58)
             .max(0.0);
     let occlusion_radius =
-        (shadow_radius + ICON_MAX_HALF_DIAGONAL * boundary_scale + overlap_edge_gap).max(0.0);
-    let contact_depth =
-        ((occlusion_radius - shadow_radius) / nominal_contact_clearance).clamp(0.0, 1.0);
-    let inner_target = occlusion_radius * 0.72;
-    let full_crossing_target = (shadow_radius - nominal_contact_clearance).max(0.0);
-    let crossing_end_radius = (inner_target
-        + (full_crossing_target - inner_target) * smoothstep(0.0, 1.0, contact_depth))
-    .clamp(0.0, occlusion_radius);
+        (shadow_radius + icon_half_extent * boundary_radial_scale + overlap_edge_gap).max(0.0);
+    let (crossing_radial_scale, crossing_tangential_scale) =
+        tidal_scales(boundary_base_scale * 0.88, 1.18);
+    let crossing_end_radius = (shadow_radius - icon_half_extent * crossing_radial_scale - 2.0)
+        .clamp(0.0, occlusion_radius);
     let attraction_span = (start_radius - attraction_end_radius).max(0.0);
     let capture_span = (attraction_end_radius - capture_end_radius).max(0.0);
     let capture_start_slope = if capture_span > f32::EPSILON {
@@ -892,10 +969,12 @@ fn visual_sample(
             let t = normalized_time(elapsed, ATTRACTING_SECONDS);
             let accelerated = cubic_hermite_progress(t, 0.0, attraction_end_slope);
             let radius = start_radius + (attraction_end_radius - start_radius) * accelerated;
+            let scale = 1.0 - 0.06 * accelerated;
             VisualSample {
                 position: direction * radius,
-                scale: 1.0 - 0.06 * accelerated,
-                rotation: 0.0,
+                radial_direction: direction,
+                radial_scale: scale,
+                tangential_scale: scale,
                 alpha: 1.0,
                 redshift: 0.0,
             }
@@ -908,10 +987,14 @@ fn visual_sample(
             let scale_eased = cubic_hermite_progress(t, capture_scale_start_slope, 0.0);
             let radius =
                 attraction_end_radius + (capture_end_radius - attraction_end_radius) * eased;
+            let base_scale = 0.94 - 0.06 * scale_eased;
+            let (radial_scale, tangential_scale) =
+                tidal_scales(base_scale, 0.10 * smoothstep(0.0, 1.0, t));
             VisualSample {
                 position: direction * radius,
-                scale: 0.94 - 0.06 * scale_eased,
-                rotation: 0.0,
+                radial_direction: direction,
+                radial_scale,
+                tangential_scale,
                 alpha: 1.0,
                 redshift: 0.04 * eased,
             }
@@ -922,10 +1005,17 @@ fn visual_sample(
             // at the apparent horizon to evoke the distant-observer time delay.
             let accelerated = smoothstep(0.0, 1.0, t.powf(1.35));
             let radius = capture_end_radius + (occlusion_radius - capture_end_radius) * accelerated;
+            let base_scale = 0.88 + (boundary_base_scale - 0.88) * accelerated;
+            // Schwarzschild tidal acceleration grows as the inverse cube of
+            // distance. Screen radius is not proper distance, so this monotonic
+            // proxy conveys the gradient without claiming a literal scale model.
+            let tidal_strength = 0.10 + 0.90 * smoothstep(0.0, 1.0, t.powf(1.45));
+            let (radial_scale, tangential_scale) = tidal_scales(base_scale, tidal_strength);
             VisualSample {
                 position: direction * radius,
-                scale: 0.88 + (boundary_scale - 0.88) * accelerated,
-                rotation: 0.0,
+                radial_direction: direction,
+                radial_scale,
+                tangential_scale,
                 alpha: 1.0 + (boundary_alpha - 1.0) * smoothstep(0.55, 1.0, t),
                 redshift: 0.04 + (boundary_redshift - 0.04) * smoothstep(0.35, 1.0, t),
             }
@@ -934,18 +1024,24 @@ fn visual_sample(
             let t = normalized_time(elapsed, EVENT_HORIZON_SECONDS);
             let eased = smoothstep(0.0, 1.0, t);
             let radius = occlusion_radius + (crossing_end_radius - occlusion_radius) * eased;
+            let radial_scale =
+                boundary_radial_scale + (crossing_radial_scale - boundary_radial_scale) * eased;
+            let tangential_scale = boundary_tangential_scale
+                + (crossing_tangential_scale - boundary_tangential_scale) * eased;
             VisualSample {
                 position: direction * radius,
-                scale: boundary_scale * (1.0 - 0.30 * eased),
-                rotation: 0.0,
+                radial_direction: direction,
+                radial_scale,
+                tangential_scale,
                 alpha: boundary_alpha * (1.0 - smoothstep(0.82, 1.0, t)),
                 redshift: boundary_redshift + (1.0 - boundary_redshift) * eased,
             }
         }
         VisualPhase::Success => VisualSample {
             position: direction * crossing_end_radius,
-            scale: boundary_scale * 0.70,
-            rotation: 0.0,
+            radial_direction: direction,
+            radial_scale: crossing_radial_scale,
+            tangential_scale: crossing_tangential_scale,
             alpha: 0.0,
             redshift: 1.0,
         },
@@ -958,12 +1054,17 @@ fn visual_sample(
             };
             let rebound = minimum_extent * 0.24 * ease_out_back(t);
             let recovery = smoothstep(0.0, 0.28, t);
-            let recovered_scale = failure.scale + (0.62 - failure.scale) * recovery;
+            let pulse = 0.12 * (PI * t).sin();
+            let radial_scale =
+                failure.radial_scale + (0.62 - failure.radial_scale) * recovery + pulse;
+            let tangential_scale =
+                failure.tangential_scale + (0.62 - failure.tangential_scale) * recovery + pulse;
             let recovered_alpha = failure.alpha + (1.0 - failure.alpha) * recovery;
             VisualSample {
                 position: failure.origin + direction * rebound,
-                scale: recovered_scale + 0.12 * (PI * t).sin(),
-                rotation: 0.0,
+                radial_direction: direction,
+                radial_scale,
+                tangential_scale,
                 alpha: recovered_alpha * (1.0 - smoothstep(0.56, 1.0, t)),
                 redshift: 0.0,
             }
@@ -1024,6 +1125,27 @@ fn drop_target_contains(cursor: Vec2, size: Vec2, pitch: f32, lens_radius: f32) 
     (screen.x / disk_major).powi(2) + (screen.y / disk_minor).powi(2) <= 1.0
 }
 
+fn drag_lens_influence_strength(cursor: Vec2, size: Vec2, lens_radius: f32) -> f32 {
+    if !cursor.is_finite() || size.x <= 1.0 || size.y <= 1.0 {
+        return 0.0;
+    }
+
+    let aspect = size.x / size.y;
+    let screen = Vec2::new(
+        (cursor.x / size.x * 2.0 - 1.0) * aspect,
+        1.0 - cursor.y / size.y * 2.0,
+    );
+    let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
+    let influence_radius =
+        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius.clamp(0.4, 2.0))
+            .clamp(0.12, 3.0)
+            .max(shadow_radius * 1.08);
+    let coordinate = ((screen.length() - shadow_radius)
+        / (influence_radius - shadow_radius).max(0.01))
+    .clamp(0.0, 1.0);
+    1.0 - smoothstep(0.62, 1.0, coordinate)
+}
+
 fn normalized_rendered_shadow_radius(lens_radius: f32) -> f32 {
     CRITICAL_IMPACT_PARAMETER_RS / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius))
 }
@@ -1036,23 +1158,39 @@ fn rendered_shadow_radius(viewport_size: Vec2, lens_radius: f32) -> f32 {
     viewport_size.y.max(1.0) * 0.5 * normalized_rendered_shadow_radius(lens_radius)
 }
 
+fn icon_radial_half_extent(kind: DropVisualKind, radial_direction: Vec2) -> f32 {
+    let half_size = match kind {
+        DropVisualKind::File => Vec2::new(27.0, 30.0),
+        DropVisualKind::Application => Vec2::splat(29.0),
+    };
+    radial_direction.x.abs() * half_size.x + radial_direction.y.abs() * half_size.y
+}
+
+fn tidal_scales(base_scale: f32, strength: f32) -> (f32, f32) {
+    const LOG_STRAIN: f32 = 0.22;
+    let strain = LOG_STRAIN * strength.clamp(0.0, 1.25);
+    (
+        base_scale * (2.0 * strain).exp(),
+        base_scale * (-strain).exp(),
+    )
+}
+
 fn shadow_visibility(
     parent_position: Vec2,
-    parent_scale: f32,
+    radial_direction: Vec2,
+    radial_scale: f32,
     child_offset: Vec2,
     child_size: Vec2,
     shadow_radius: f32,
 ) -> f32 {
-    let parent_radius = parent_position.length();
-    if parent_radius <= f32::EPSILON {
+    if parent_position.length_squared() <= f32::EPSILON {
         return 0.0;
     }
 
-    let radial_direction = parent_position / parent_radius;
-    let child_center = parent_position + child_offset * parent_scale;
-    let center_radius = child_center.dot(radial_direction);
+    let center_radius =
+        parent_position.dot(radial_direction) + child_offset.dot(radial_direction) * radial_scale;
     let half_radial_extent = 0.5
-        * parent_scale
+        * radial_scale
         * (radial_direction.x.abs() * child_size.x + radial_direction.y.abs() * child_size.y)
             .max(0.001);
     let outside_fraction =
@@ -1067,6 +1205,11 @@ fn normalized_time(elapsed: f32, duration: f32) -> f32 {
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+fn rotate_2d(value: Vec2, angle: f32) -> Vec2 {
+    let (sin, cos) = angle.sin_cos();
+    Vec2::new(cos * value.x - sin * value.y, sin * value.x + cos * value.y)
 }
 
 fn cubic_hermite_progress(value: f32, start_slope: f32, end_slope: f32) -> f32 {
@@ -1112,6 +1255,27 @@ fn apply_gravitational_redshift(rgb: [f32; 3], amount: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visual_sample(
+        phase: VisualPhase,
+        elapsed: f32,
+        start_position: Vec2,
+        failure: FailureVisualState,
+        infall_lane: u8,
+        viewport_size: Vec2,
+        lens_radius: f32,
+    ) -> VisualSample {
+        super::visual_sample(
+            phase,
+            elapsed,
+            start_position,
+            failure,
+            DropVisualKind::File,
+            infall_lane,
+            viewport_size,
+            lens_radius,
+        )
+    }
 
     #[test]
     fn batch_preserves_order_and_deduplicates() {
@@ -1216,13 +1380,92 @@ mod tests {
         assert!(infall_end.position.length() < infall_start.position.length());
         assert!(start.perp_dot(infall_end.position).abs() < 0.01);
         assert!(start.dot(infall_end.position) > 0.0);
-        assert_eq!(infall_start.rotation, 0.0);
-        assert_eq!(infall_end.rotation, 0.0);
-        let expected_contact_radius =
-            rendered_shadow_radius(size, lens_radius) + ICON_MAX_HALF_DIAGONAL * 0.38;
+        assert!((infall_start.radial_direction - start.normalize()).length() < 0.001);
+        assert!((infall_end.radial_direction - start.normalize()).length() < 0.001);
+        assert!(infall_end.radial_scale > infall_end.tangential_scale);
+        let expected_contact_radius = rendered_shadow_radius(size, lens_radius)
+            + icon_radial_half_extent(DropVisualKind::File, start.normalize())
+                * infall_end.radial_scale;
         assert!((infall_end.position.length() - expected_contact_radius).abs() < 0.01);
         assert!(entering_end.position.length() < infall_end.position.length());
         assert_eq!(entering_end.alpha, 0.0);
+    }
+
+    #[test]
+    fn tidal_deformation_preserves_radial_and_tangential_axes_without_rigid_spin() {
+        let source = Vec2::new(17.0, -9.0);
+        for step in 0..16 {
+            let angle = TAU * step as f32 / 16.0;
+            let radial = Vec2::from_angle(angle);
+            let tangential = radial.perp();
+
+            let deform = |value: Vec2, radial_scale: f32, tangential_scale: f32| {
+                let local = rotate_2d(value, -angle);
+                rotate_2d(
+                    Vec2::new(local.x * radial_scale, local.y * tangential_scale),
+                    angle,
+                )
+            };
+
+            let isotropic = deform(source, 0.73, 0.73);
+            assert!((isotropic - source * 0.73).length() < 0.001);
+
+            let stretched_radial = deform(radial, 1.42, 0.61);
+            let compressed_tangential = deform(tangential, 1.42, 0.61);
+            assert!((stretched_radial - radial * 1.42).length() < 0.001);
+            assert!((compressed_tangential - tangential * 0.61).length() < 0.001);
+        }
+    }
+
+    #[test]
+    fn tidal_aspect_ratio_grows_monotonically_during_infall() {
+        let size = Vec2::new(900.0, 700.0);
+        let start = Vec2::new(320.0, -140.0);
+        let mut previous_ratio = 1.0;
+
+        for step in 0..=64 {
+            let sample = visual_sample(
+                VisualPhase::Infalling,
+                INFALLING_SECONDS * step as f32 / 64.0,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                1.0,
+            );
+            let ratio = sample.radial_scale / sample.tangential_scale;
+            assert!(ratio + f32::EPSILON >= previous_ratio);
+            assert!(start.perp_dot(sample.position).abs() < 0.01);
+            previous_ratio = ratio;
+        }
+
+        assert!(previous_ratio > 1.8);
+    }
+
+    #[test]
+    fn file_and_application_visuals_touch_the_rendered_shadow_before_crossing() {
+        let size = Vec2::new(900.0, 700.0);
+        let shadow = rendered_shadow_radius(size, 1.0);
+
+        for kind in [DropVisualKind::File, DropVisualKind::Application] {
+            for step in 0..16 {
+                let direction = Vec2::from_angle(TAU * step as f32 / 16.0);
+                let start = direction * 330.0;
+                let sample = super::visual_sample(
+                    VisualPhase::Infalling,
+                    INFALLING_SECONDS,
+                    start,
+                    failure_visual(start),
+                    kind,
+                    0,
+                    size,
+                    1.0,
+                );
+                let inner_edge = sample.position.length()
+                    - icon_radial_half_extent(kind, direction) * sample.radial_scale;
+                assert!((inner_edge - shadow).abs() < 0.01);
+            }
+        }
     }
 
     #[test]
@@ -1275,7 +1518,7 @@ mod tests {
                             radius <= previous_radius + 0.001,
                             "lane {lane}, phase {phase:?}, step {step}: {radius} > {previous_radius}"
                         );
-                        assert_eq!(sample.rotation, 0.0);
+                        assert!((sample.radial_direction - expected_direction).length() < 0.001);
                         assert!(
                             expected_direction.perp_dot(sample.position).abs() < 0.01,
                             "lane {lane}, phase {phase:?}, step {step}: path left its radial line"
@@ -1342,15 +1585,52 @@ mod tests {
             );
 
             assert!((attraction_end.position - capture_start.position).length() < 0.001);
-            assert!((attraction_end.scale - capture_start.scale).abs() < f32::EPSILON);
+            assert!(
+                (attraction_end.radial_scale - capture_start.radial_scale).abs() < f32::EPSILON
+            );
+            assert!(
+                (attraction_end.tangential_scale - capture_start.tangential_scale).abs()
+                    < f32::EPSILON
+            );
             let attraction_position_rate =
                 (attraction_end.position.length() - attraction_before.position.length()) / delta;
             let capture_position_rate =
                 (capture_after.position.length() - capture_start.position.length()) / delta;
-            let attraction_scale_rate = (attraction_end.scale - attraction_before.scale) / delta;
-            let capture_scale_rate = (capture_after.scale - capture_start.scale) / delta;
+            let attraction_scale_rate =
+                (attraction_end.radial_scale - attraction_before.radial_scale) / delta;
+            let capture_scale_rate =
+                (capture_after.radial_scale - capture_start.radial_scale) / delta;
             assert!((attraction_position_rate - capture_position_rate).abs() < 2.0);
             assert!((attraction_scale_rate - capture_scale_rate).abs() < 0.02);
+        }
+    }
+
+    #[test]
+    fn every_capture_boundary_is_continuous_in_position_shape_and_redshift() {
+        let size = Vec2::new(900.0, 700.0);
+        let start = Vec2::new(-280.0, 145.0);
+        let failure = failure_visual(start);
+        let at = |phase, elapsed| visual_sample(phase, elapsed, start, failure, 0, size, 1.0);
+
+        for (left, right) in [
+            (
+                at(VisualPhase::Attracting, ATTRACTING_SECONDS),
+                at(VisualPhase::Capturing, 0.0),
+            ),
+            (
+                at(VisualPhase::Capturing, CAPTURING_SECONDS),
+                at(VisualPhase::Infalling, 0.0),
+            ),
+            (
+                at(VisualPhase::Infalling, INFALLING_SECONDS),
+                at(VisualPhase::EnteringEventHorizon, 0.0),
+            ),
+        ] {
+            assert!((left.position - right.position).length() < 0.001);
+            assert!((left.radial_scale - right.radial_scale).abs() < 0.000_01);
+            assert!((left.tangential_scale - right.tangential_scale).abs() < 0.000_01);
+            assert!((left.alpha - right.alpha).abs() < 0.000_01);
+            assert!((left.redshift - right.redshift).abs() < 0.000_01);
         }
     }
 
@@ -1381,8 +1661,11 @@ mod tests {
                             size,
                             lens_radius,
                         );
-                        let inner_edge =
-                            sample.position.length() - ICON_MAX_HALF_DIAGONAL * sample.scale;
+                        let inner_edge = sample.position.length()
+                            - icon_radial_half_extent(
+                                DropVisualKind::File,
+                                sample.radial_direction,
+                            ) * sample.radial_scale;
                         assert!(
                             inner_edge + 0.001 >= shadow_radius,
                             "lane {lane}, phase {phase:?}, step {step}: {inner_edge} < {shadow_radius}"
@@ -1399,8 +1682,9 @@ mod tests {
                     size,
                     lens_radius,
                 );
-                let waiting_inner_edge =
-                    waiting.position.length() - ICON_MAX_HALF_DIAGONAL * waiting.scale;
+                let waiting_inner_edge = waiting.position.length()
+                    - icon_radial_half_extent(DropVisualKind::File, waiting.radial_direction)
+                        * waiting.radial_scale;
                 assert!(waiting_inner_edge + 0.001 >= shadow_radius);
             }
         }
@@ -1448,6 +1732,52 @@ mod tests {
         );
         assert_eq!(previous_alpha, 0.0);
         assert_eq!(success.alpha, 0.0);
+    }
+
+    #[test]
+    fn horizon_crossing_swallows_core_tiles_from_the_inner_edge_without_reappearing() {
+        let size = Vec2::new(900.0, 700.0);
+        let start = Vec2::new(290.0, 170.0);
+        let shadow = rendered_shadow_radius(size, 1.0);
+        let cell_size = Vec2::new(38.0, 48.0) / 4.0;
+        let lower_left = -Vec2::new(38.0, 48.0) * 0.5 + cell_size * 0.5;
+        let offsets = (0..4)
+            .flat_map(|y| {
+                (0..4).map(move |x| lower_left + Vec2::new(x as f32, y as f32) * cell_size)
+            })
+            .collect::<Vec<_>>();
+        let mut previous = vec![1.0; offsets.len()];
+
+        for step in 0..=64 {
+            let sample = visual_sample(
+                VisualPhase::EnteringEventHorizon,
+                EVENT_HORIZON_SECONDS * step as f32 / 64.0,
+                start,
+                failure_visual(start),
+                0,
+                size,
+                1.0,
+            );
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                let visibility = sample.alpha
+                    * shadow_visibility(
+                        sample.position,
+                        sample.radial_direction,
+                        sample.radial_scale,
+                        offset,
+                        cell_size,
+                        shadow,
+                    );
+                assert!(
+                    visibility <= previous[index] + 0.000_1,
+                    "tile {index} reappeared at step {step}: {visibility} > {}",
+                    previous[index]
+                );
+                previous[index] = visibility;
+            }
+        }
+
+        assert!(previous.into_iter().all(|visibility| visibility == 0.0));
     }
 
     #[test]
@@ -1541,7 +1871,8 @@ mod tests {
         let just_outside = sample_at(shadow + 0.5);
 
         assert!((just_inside.position.length() - just_outside.position.length()).abs() < 2.0);
-        assert!((just_inside.scale - just_outside.scale).abs() < 0.01);
+        assert!((just_inside.radial_scale - just_outside.radial_scale).abs() < 0.01);
+        assert!((just_inside.tangential_scale - just_outside.tangential_scale).abs() < 0.01);
         assert!((just_inside.alpha - just_outside.alpha).abs() < 0.02);
     }
 
@@ -1551,12 +1882,30 @@ mod tests {
         let scale = 0.4;
         let size = Vec2::splat(50.0);
 
-        let outside =
-            shadow_visibility(Vec2::new(90.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
-        let straddling =
-            shadow_visibility(Vec2::new(80.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
-        let inside =
-            shadow_visibility(Vec2::new(70.0, 0.0), scale, Vec2::ZERO, size, shadow_radius);
+        let outside = shadow_visibility(
+            Vec2::new(90.0, 0.0),
+            Vec2::X,
+            scale,
+            Vec2::ZERO,
+            size,
+            shadow_radius,
+        );
+        let straddling = shadow_visibility(
+            Vec2::new(80.0, 0.0),
+            Vec2::X,
+            scale,
+            Vec2::ZERO,
+            size,
+            shadow_radius,
+        );
+        let inside = shadow_visibility(
+            Vec2::new(70.0, 0.0),
+            Vec2::X,
+            scale,
+            Vec2::ZERO,
+            size,
+            shadow_radius,
+        );
 
         assert_eq!(outside, 1.0);
         assert!((straddling - 0.5).abs() < f32::EPSILON);
@@ -1567,7 +1916,8 @@ mod tests {
     fn failure_feedback_starts_from_the_last_visible_scale_and_alpha() {
         let failure = FailureVisualState {
             origin: Vec2::new(90.0, 20.0),
-            scale: 0.83,
+            radial_scale: 0.83,
+            tangential_scale: 0.46,
             alpha: 0.47,
         };
         let sample = visual_sample(
@@ -1580,7 +1930,8 @@ mod tests {
             1.0,
         );
 
-        assert!((sample.scale - failure.scale).abs() < f32::EPSILON);
+        assert!((sample.radial_scale - failure.radial_scale).abs() < f32::EPSILON);
+        assert!((sample.tangential_scale - failure.tangential_scale).abs() < f32::EPSILON);
         assert!((sample.alpha - failure.alpha).abs() < f32::EPSILON);
         assert_eq!(sample.position, failure.origin);
     }
@@ -1609,6 +1960,126 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn drag_lens_influence_covers_center_acceptance_and_influence_boundaries() {
+        let size = Vec2::new(900.0, 700.0);
+        let lens_radius = 1.0;
+        let center = size * 0.5;
+        let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
+        let acceptance_radius = normalized_drop_target_shadow_radius(lens_radius);
+        let influence_radius = test_drag_influence_radius(lens_radius);
+
+        assert_eq!(drag_lens_influence_strength(center, size, lens_radius), 1.0);
+        assert_eq!(
+            drag_lens_influence_strength(
+                cursor_at_screen_radius(size, shadow_radius),
+                size,
+                lens_radius,
+            ),
+            1.0,
+        );
+        assert_eq!(
+            drag_lens_influence_strength(
+                cursor_at_screen_radius(size, acceptance_radius),
+                size,
+                lens_radius,
+            ),
+            1.0,
+        );
+
+        let just_inside = drag_lens_influence_strength(
+            cursor_at_screen_radius(size, influence_radius - 0.001),
+            size,
+            lens_radius,
+        );
+        let at_boundary = drag_lens_influence_strength(
+            cursor_at_screen_radius(size, influence_radius),
+            size,
+            lens_radius,
+        );
+        let outside = drag_lens_influence_strength(
+            cursor_at_screen_radius(size, influence_radius + 0.001),
+            size,
+            lens_radius,
+        );
+
+        assert!(just_inside > 0.0);
+        assert!(at_boundary <= 0.000_01);
+        assert_eq!(outside, 0.0);
+    }
+
+    #[test]
+    fn drag_lens_influence_rejects_invalid_cursor_and_degenerate_windows() {
+        let center = Vec2::splat(0.5);
+        for size in [
+            Vec2::ZERO,
+            Vec2::new(0.5, 700.0),
+            Vec2::new(900.0, 0.5),
+            Vec2::ONE,
+        ] {
+            assert_eq!(drag_lens_influence_strength(center, size, 1.0), 0.0);
+        }
+
+        let barely_valid = Vec2::splat(1.000_1);
+        assert_eq!(
+            drag_lens_influence_strength(barely_valid * 0.5, barely_valid, 1.0),
+            1.0,
+        );
+
+        let size = Vec2::new(900.0, 700.0);
+        for cursor in [
+            Vec2::new(f32::NAN, 0.0),
+            Vec2::new(f32::INFINITY, 0.0),
+            Vec2::new(0.0, f32::NEG_INFINITY),
+        ] {
+            assert_eq!(drag_lens_influence_strength(cursor, size, 1.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn drag_lens_influence_stays_finite_for_extreme_and_non_finite_lens_values() {
+        let size = Vec2::new(900.0, 700.0);
+        for lens_radius in [
+            -1.0e6,
+            0.0,
+            0.4,
+            2.0,
+            1.0e6,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
+            let samples = [
+                size * 0.5,
+                cursor_at_screen_radius(size, shadow_radius),
+                Vec2::new(-size.x, -size.y),
+            ];
+            for cursor in samples {
+                let strength = drag_lens_influence_strength(cursor, size, lens_radius);
+                assert!(
+                    strength.is_finite() && (0.0..=1.0).contains(&strength),
+                    "lens {lens_radius:?}, cursor {cursor:?}: {strength}"
+                );
+            }
+            assert_eq!(
+                drag_lens_influence_strength(size * 0.5, size, lens_radius),
+                1.0,
+            );
+        }
+    }
+
+    fn cursor_at_screen_radius(size: Vec2, screen_radius: f32) -> Vec2 {
+        Vec2::new(size.x * 0.5 + screen_radius * size.y * 0.5, size.y * 0.5)
+    }
+
+    fn test_drag_influence_radius(lens_radius: f32) -> f32 {
+        let shadow_radius = normalized_rendered_shadow_radius(lens_radius);
+        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius.clamp(0.4, 2.0))
+            .clamp(0.12, 3.0)
+            .max(shadow_radius * 1.08)
+    }
+
     fn test_visual(authorized: bool) -> DropVisual {
         DropVisual {
             id: 7,
@@ -1627,7 +2098,8 @@ mod tests {
     fn failure_visual(origin: Vec2) -> FailureVisualState {
         FailureVisualState {
             origin,
-            scale: 1.0,
+            radial_scale: 1.0,
+            tangential_scale: 1.0,
             alpha: 1.0,
         }
     }

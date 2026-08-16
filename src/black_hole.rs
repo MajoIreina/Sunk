@@ -18,7 +18,8 @@ use bevy::{
     window::{CursorOptions, PrimaryWindow, WindowResized},
 };
 
-use crate::desktop_capture::DesktopCaptureState;
+use crate::desktop_capture::{DesktopCaptureState, DesktopCaptureSystems};
+use crate::file_interaction::{DropInteractionState, FileInteractionSystems};
 use crate::physics::{EVENT_HORIZON_RS, ISCO_RS};
 use crate::settings::BlackHoleSettings;
 use crate::window_interaction::render_tan_half_fov;
@@ -61,7 +62,10 @@ impl Plugin for BlackHolePlugin {
                 (
                     resize_canvas,
                     handle_controls,
-                    sync_material.after(handle_controls),
+                    sync_material
+                        .after(handle_controls)
+                        .after(FileInteractionSystems::ObserveDrops)
+                        .after(DesktopCaptureSystems::Sync),
                     capture_qa_frame.after(sync_material),
                 ),
             );
@@ -156,6 +160,8 @@ struct BlackHoleUniform {
     desktop_uv_origin_scale: Vec4,
     /// subpixel offset.xy (in pixels), sample weight, reserved
     sample: Vec4,
+    /// native drag cursor UV.xy, lens influence, capture-target state
+    drag_feedback: Vec4,
 }
 
 impl Default for BlackHoleUniform {
@@ -176,6 +182,7 @@ impl Default for BlackHoleUniform {
             desktop: Vec4::new(0.0, 1.0, 0.78, 0.0),
             desktop_uv_origin_scale: Vec4::new(0.0, 0.0, 1.0, 1.0),
             sample: Vec4::new(0.0, 0.0, 1.0, 0.0),
+            drag_feedback: Vec4::ZERO,
         }
     }
 }
@@ -338,10 +345,15 @@ fn handle_controls(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "material synchronization reads independent render, window, and interaction resources"
+)]
 fn sync_material(
     windows: Single<&Window, With<PrimaryWindow>>,
     controls: Res<BlackHoleControls>,
     settings: Res<BlackHoleSettings>,
+    drop_interaction: Res<DropInteractionState>,
     desktop_capture: Res<DesktopCaptureState>,
     material_handles: Res<BlackHoleMaterialHandles>,
     mut materials: ResMut<Assets<BlackHoleMaterial>>,
@@ -399,6 +411,16 @@ fn sync_material(
         ),
         desktop_uv_origin_scale: desktop_capture.uv_origin_scale,
         sample: Vec4::ZERO,
+        drag_feedback: Vec4::new(
+            drop_interaction.feedback_uv.x,
+            drop_interaction.feedback_uv.y,
+            if drop_interaction.drag_active {
+                drop_interaction.influence_strength
+            } else {
+                0.0
+            },
+            f32::from(drop_interaction.hovering_black_hole),
+        ),
     };
 
     for (sample_index, handle) in material_handles.0.iter().enumerate() {

@@ -16,8 +16,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const HIGH_CONFIDENCE_SCORE: u32 = 500;
-const ARGUMENT_BEARING_SHORTCUT_SCORE: u32 = 800;
+const MIN_UNINSTALL_MATCH_SCORE: u32 = 100;
 const WORKER_COMMAND_CAPACITY: usize = 512;
 const DENIED_EXECUTABLE_HOSTS: &[&str] = &[
     "cmd.exe",
@@ -52,7 +51,6 @@ pub enum FileOperationErrorKind {
     ShortcutResolution,
     RegistryRead,
     NoUninstallCandidate,
-    AmbiguousUninstallCandidate,
     UnsafeUninstallCommand,
     Io,
     WorkerDisconnected,
@@ -556,26 +554,18 @@ fn score_uninstall_entry<'a>(
         evidence.push(MatchEvidence::ExactExecutableStem);
     }
 
-    let has_shortcut_arguments = identity
-        .shortcut_arguments
-        .as_deref()
-        .is_some_and(|arguments| !arguments.trim().is_empty());
-    let threshold = if has_shortcut_arguments {
-        ARGUMENT_BEARING_SHORTCUT_SCORE
-    } else {
-        HIGH_CONFIDENCE_SCORE
-    };
-    let argument_bearing_name_matches =
-        !has_shortcut_arguments || evidence.contains(&MatchEvidence::ExactDisplayName);
-    if score < threshold || !argument_bearing_name_matches {
+    // Arguments do not veto an otherwise eligible match. Browser-hosted and
+    // alternate-mode shortcuts can therefore expose their registered host in
+    // the confirmation dialog, where the user sees the exact uninstall source.
+    if score < MIN_UNINSTALL_MATCH_SCORE {
         return None;
     }
     let launch_plan = build_launch_plan(entry, identity.msi_product_code.as_deref()).ok()?;
     if !launch_plan_is_bound_to_identity(identity, entry, &launch_plan) {
         return None;
     }
-    if matches!(&launch_plan, UninstallLaunchPlan::Exe { .. }) {
-        evidence.push(MatchEvidence::ApplicationTarget(target?.to_owned()));
+    if let Some(target) = target {
+        evidence.push(MatchEvidence::ApplicationTarget(target.to_owned()));
     }
     Some(ScoredEntry {
         entry,
@@ -593,28 +583,42 @@ pub fn select_uninstall_candidate(
         .iter()
         .filter_map(|entry| score_uninstall_entry(identity, entry))
         .collect::<Vec<_>>();
-    scored.sort_by_key(|candidate| std::cmp::Reverse(candidate.score));
+    scored.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                registry_hive_rank(left.entry.hive).cmp(&registry_hive_rank(right.entry.hive))
+            })
+            .then_with(|| {
+                registry_view_rank(left.entry.view).cmp(&registry_view_rank(right.entry.view))
+            })
+            .then_with(|| {
+                left.entry
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&right.entry.display_name.to_lowercase())
+            })
+            .then_with(|| {
+                left.entry
+                    .key_name
+                    .to_lowercase()
+                    .cmp(&right.entry.key_name.to_lowercase())
+            })
+            .then_with(|| {
+                left.entry
+                    .uninstall_string
+                    .to_lowercase()
+                    .cmp(&right.entry.uninstall_string.to_lowercase())
+            })
+    });
 
     let Some(best) = scored.first() else {
         return Err(FileOperationError::new(
             FileOperationErrorKind::NoUninstallCandidate,
-            "no high-confidence uninstall entry matched the dropped application",
+            "no uninstall entry matched the dropped application",
         ));
     };
-    let tied = scored
-        .iter()
-        .take_while(|candidate| candidate.score == best.score)
-        .collect::<Vec<_>>();
-    if tied.len() > 1
-        && !tied
-            .iter()
-            .all(|candidate| same_logical_uninstall_entry(best.entry, candidate.entry))
-    {
-        return Err(FileOperationError::new(
-            FileOperationErrorKind::AmbiguousUninstallCandidate,
-            "multiple uninstall entries matched with the same confidence",
-        ));
-    }
 
     Ok(UninstallCandidate {
         entry: best.entry.clone(),
@@ -624,22 +628,18 @@ pub fn select_uninstall_candidate(
     })
 }
 
-fn same_logical_uninstall_entry(left: &UninstallEntry, right: &UninstallEntry) -> bool {
-    if let (Some(left_code), Some(right_code)) = (
-        normalize_product_code(&left.key_name),
-        normalize_product_code(&right.key_name),
-    ) {
-        return left_code == right_code;
+const fn registry_hive_rank(hive: RegistryHive) -> u8 {
+    match hive {
+        RegistryHive::CurrentUser => 0,
+        RegistryHive::LocalMachine => 1,
     }
-    names_match(&left.display_name, &right.display_name)
-        && left
-            .uninstall_string
-            .eq_ignore_ascii_case(&right.uninstall_string)
-        && match (&left.install_location, &right.install_location) {
-            (Some(left), Some(right)) => paths_equal(left, right),
-            (None, None) => true,
-            _ => false,
-        }
+}
+
+const fn registry_view_rank(view: RegistryView) -> u8 {
+    match view {
+        RegistryView::Registry64 => 0,
+        RegistryView::Registry32 => 1,
+    }
 }
 
 fn paths_equal(left: &Path, right: &Path) -> bool {
@@ -709,21 +709,14 @@ fn launch_plan_is_bound_to_identity(
                     .is_none_or(|advertised| advertised == product_code.as_str())
         }
         UninstallLaunchPlan::Exe { executable, .. } => {
-            let (Some(target), Some(install_location)) = (
-                identity.target_executable.as_deref(),
-                entry.install_location.as_deref(),
-            ) else {
-                return false;
-            };
-            install_location_is_specific(install_location)
-                && path_is_within(target, install_location)
-                && path_is_within(executable, install_location)
+            let executable_text = executable.as_os_str().to_string_lossy();
+            validate_uninstall_executable_text(&executable_text).is_ok()
         }
     }
 }
 
 pub fn parse_uninstall_command(command: &str) -> FileOperationResultValue<UninstallLaunchPlan> {
-    let arguments = parse_windows_command_line(command)?;
+    let arguments = parse_registered_uninstall_arguments(command)?;
     let Some(executable) = arguments.first() else {
         return Err(unsafe_command("uninstall command is empty"));
     };
@@ -747,6 +740,59 @@ pub fn parse_uninstall_command(command: &str) -> FileOperationResultValue<Uninst
         executable: executable_path,
         arguments: arguments[1..].iter().map(OsString::from).collect(),
     })
+}
+
+fn parse_registered_uninstall_arguments(command: &str) -> FileOperationResultValue<Vec<String>> {
+    let parsed = parse_windows_command_line(command)?;
+    let first_is_usable = parsed.first().is_some_and(|executable| {
+        let file_name = Path::new(executable)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        file_name.eq_ignore_ascii_case("msiexec")
+            || file_name.eq_ignore_ascii_case("msiexec.exe")
+            || validate_uninstall_executable_text(executable).is_ok()
+    });
+    if first_is_usable {
+        return Ok(parsed);
+    }
+
+    let Some((executable, argument_tail)) = unquoted_executable_prefix(command) else {
+        return Ok(parsed);
+    };
+    let mut recovered = vec![executable.to_owned()];
+    if !argument_tail.trim().is_empty() {
+        // CommandLineToArgvW has no arguments-only mode. A fixed synthetic argv[0]
+        // lets Windows apply its quoting and backslash rules to the real tail.
+        let synthetic = format!(r#"sunk-argv.exe {}"#, argument_tail.trim_start());
+        let mut tail = parse_windows_command_line(&synthetic)?;
+        if !tail.is_empty() {
+            tail.remove(0);
+        }
+        recovered.extend(tail);
+    }
+    Ok(recovered)
+}
+
+fn unquoted_executable_prefix(command: &str) -> Option<(&str, &str)> {
+    let command = command.trim_start();
+    if command.starts_with('"') {
+        return None;
+    }
+
+    let bytes = command.as_bytes();
+    for index in 0..bytes.len().saturating_sub(3) {
+        if bytes[index..index + 4].eq_ignore_ascii_case(b".exe") {
+            let end = index + 4;
+            if end == bytes.len() || bytes[end].is_ascii_whitespace() {
+                let executable = command[..end].trim_end();
+                if is_local_absolute_windows_path(executable) {
+                    return Some((executable, &command[end..]));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn unsafe_command(message: impl Into<String>) -> FileOperationError {
@@ -1499,62 +1545,6 @@ mod windows_backend {
                 executable,
                 arguments,
             } => {
-                if !candidate
-                    .evidence
-                    .contains(&MatchEvidence::InsideInstallLocation)
-                {
-                    return Err(unsafe_command(
-                        "application target was not bound to its installation directory",
-                    ));
-                }
-                let application_target = candidate
-                    .evidence
-                    .iter()
-                    .find_map(|evidence| match evidence {
-                        MatchEvidence::ApplicationTarget(path) => Some(path.as_path()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| unsafe_command("candidate has no bound application target"))?;
-                let install_location = candidate
-                    .entry
-                    .install_location
-                    .as_deref()
-                    .filter(|path| install_location_is_specific(path))
-                    .ok_or_else(|| {
-                        unsafe_command("candidate has no specific installation directory")
-                    })?;
-                let install_metadata = std::fs::symlink_metadata(install_location)
-                    .map_err(|error| io_path_error(install_location, error))?;
-                if !install_metadata.is_dir() || install_metadata.file_attributes() & 0x400 != 0 {
-                    return Err(unsafe_command(
-                        "installation directory is missing, not a directory, or is a reparse point",
-                    ));
-                }
-                let canonical_install_location = std::fs::canonicalize(install_location)
-                    .map_err(|error| io_path_error(install_location, error))?;
-                if !is_local_path(&canonical_install_location) {
-                    return Err(unsafe_command(
-                        "installation directory is not on a local drive",
-                    ));
-                }
-                let application_metadata = std::fs::symlink_metadata(application_target)
-                    .map_err(|error| io_path_error(application_target, error))?;
-                if !application_metadata.is_file()
-                    || application_metadata.file_attributes() & 0x400 != 0
-                {
-                    return Err(unsafe_command(
-                        "application target is missing, not a file, or is a reparse point",
-                    ));
-                }
-                let canonical_application_target = std::fs::canonicalize(application_target)
-                    .map_err(|error| io_path_error(application_target, error))?;
-                if !is_local_path(&canonical_application_target)
-                    || !path_is_within(&canonical_application_target, &canonical_install_location)
-                {
-                    return Err(unsafe_command(
-                        "application target is outside the matched installation directory",
-                    ));
-                }
                 let executable_text = executable.as_os_str().to_string_lossy();
                 validate_uninstall_executable_text(&executable_text)?;
                 let metadata = std::fs::symlink_metadata(executable)
@@ -1568,11 +1558,6 @@ mod windows_backend {
                     .map_err(|error| io_path_error(executable, error))?;
                 if !is_local_path(&canonical) {
                     return Err(unsafe_command("uninstaller is not on a local drive"));
-                }
-                if !path_is_within(&canonical, &canonical_install_location) {
-                    return Err(unsafe_command(
-                        "uninstaller is outside the matched installation directory",
-                    ));
                 }
                 let mut command = Command::new(&canonical);
                 command.args(arguments);
@@ -1794,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_selection_requires_one_high_confidence_match() {
+    fn candidate_selection_prefers_the_strongest_match() {
         let entries = vec![
             uninstall_entry(
                 "Nova",
@@ -1813,7 +1798,7 @@ mod tests {
         ];
         let candidate = select_uninstall_candidate(&application_identity(), &entries).unwrap();
         assert_eq!(candidate.entry.display_name, "Nova");
-        assert!(candidate.score >= HIGH_CONFIDENCE_SCORE);
+        assert!(candidate.score >= MIN_UNINSTALL_MATCH_SCORE);
         assert!(
             candidate
                 .evidence
@@ -1827,7 +1812,7 @@ mod tests {
     }
 
     #[test]
-    fn tied_distinct_candidates_are_rejected() {
+    fn tied_distinct_candidates_use_a_stable_registry_order() {
         let mut second = uninstall_entry(
             "NovaTwo",
             "Nova",
@@ -1846,16 +1831,12 @@ mod tests {
             ),
             second,
         ];
-        assert_eq!(
-            select_uninstall_candidate(&application_identity(), &entries)
-                .unwrap_err()
-                .kind,
-            FileOperationErrorKind::AmbiguousUninstallCandidate
-        );
+        let candidate = select_uninstall_candidate(&application_identity(), &entries).unwrap();
+        assert_eq!(candidate.entry.key_name, "NovaOne");
     }
 
     #[test]
-    fn shortcut_arguments_require_an_exact_application_name() {
+    fn shortcut_arguments_leave_the_registered_target_to_user_confirmation() {
         let identity = ApplicationIdentity {
             source_path: PathBuf::from(r"C:\Users\Alice\Desktop\YouTube.lnk"),
             display_name_hint: "YouTube".into(),
@@ -1872,12 +1853,9 @@ mod tests {
             Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe,0"),
             r#""C:\Program Files\Google\Chrome\Application\setup.exe" --uninstall"#,
         )];
-        assert_eq!(
-            select_uninstall_candidate(&identity, &entries)
-                .unwrap_err()
-                .kind,
-            FileOperationErrorKind::NoUninstallCandidate
-        );
+        let candidate = select_uninstall_candidate(&identity, &entries).unwrap();
+        assert_eq!(candidate.entry.display_name, "Google Chrome");
+        assert!(candidate.score >= MIN_UNINSTALL_MATCH_SCORE);
     }
 
     #[test]
@@ -1921,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_plan_binding_requires_one_specific_install_tree() {
+    fn registered_exe_uninstaller_may_live_outside_the_install_tree() {
         let identity = application_identity();
         let entry = uninstall_entry(
             "Nova",
@@ -1940,9 +1918,36 @@ mod tests {
         };
 
         assert!(launch_plan_is_bound_to_identity(&identity, &entry, &inside));
-        assert!(!launch_plan_is_bound_to_identity(
+        assert!(launch_plan_is_bound_to_identity(
             &identity, &entry, &outside
         ));
+    }
+
+    #[test]
+    fn exact_executable_stem_is_enough_for_user_confirmation() {
+        let identity = ApplicationIdentity {
+            source_path: PathBuf::from(r"C:\Users\Alice\Desktop\Shortcut.lnk"),
+            display_name_hint: "Shortcut".into(),
+            target_executable: Some(PathBuf::from(r"C:\Vendor\Nova.exe")),
+            shortcut_arguments: None,
+            msi_product_code: None,
+        };
+        let entry = uninstall_entry(
+            "NovaEntry",
+            "Nova",
+            None,
+            None,
+            r#""C:\Vendor Tools\uninstall.exe" /remove"#,
+        );
+
+        let candidate = select_uninstall_candidate(&identity, &[entry]).unwrap();
+
+        assert_eq!(candidate.score, MIN_UNINSTALL_MATCH_SCORE);
+        assert!(
+            candidate
+                .evidence
+                .contains(&MatchEvidence::ExactExecutableStem)
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1973,7 +1978,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn command_parser_rejects_shell_hosts_and_unquoted_space_paths() {
+    fn command_parser_rejects_shell_hosts_and_recovers_unquoted_space_paths() {
         assert_eq!(
             parse_uninstall_command(r#"C:\Windows\System32\cmd.exe /c erase C:\data"#)
                 .unwrap_err()
@@ -1981,10 +1986,12 @@ mod tests {
             FileOperationErrorKind::UnsafeUninstallCommand
         );
         assert_eq!(
-            parse_uninstall_command(r"C:\Program Files\Nova\uninstall.exe /remove")
-                .unwrap_err()
-                .kind,
-            FileOperationErrorKind::UnsafeUninstallCommand
+            parse_uninstall_command(r#"C:\Program Files\Nova\uninstall.exe /remove "user data""#)
+                .unwrap(),
+            UninstallLaunchPlan::Exe {
+                executable: PathBuf::from(r"C:\Program Files\Nova\uninstall.exe"),
+                arguments: vec![OsString::from("/remove"), OsString::from("user data")],
+            }
         );
     }
 

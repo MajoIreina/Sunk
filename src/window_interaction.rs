@@ -35,14 +35,17 @@ impl Plugin for WindowInteractionPlugin {
         app.init_resource::<OverlayWindowRuntime>();
 
         #[cfg(target_os = "windows")]
-        app.add_systems(
-            PostUpdate,
-            (
-                windows_backend::fit_primary_window_to_black_hole,
-                windows_backend::update_primary_window_hit_test,
-            )
-                .chain(),
-        );
+        {
+            app.add_systems(Startup, windows_backend::initialize_external_drag_hook)
+                .add_systems(
+                    PostUpdate,
+                    (
+                        windows_backend::fit_primary_window_to_black_hole,
+                        windows_backend::update_primary_window_hit_test,
+                    )
+                        .chain(),
+                );
+        }
     }
 }
 
@@ -124,6 +127,31 @@ fn cursor_hits_black_hole(
     ellipse_distance <= 1.0
 }
 
+fn cursor_hits_lens_influence(cursor: Vec2, client_size: Vec2, lens_radius_scale: f32) -> bool {
+    if !cursor.is_finite()
+        || !client_size.is_finite()
+        || !lens_radius_scale.is_finite()
+        || client_size.x <= 1.0
+        || client_size.y <= 1.0
+    {
+        return false;
+    }
+
+    let aspect = client_size.x / client_size.y;
+    let screen = Vec2::new(
+        (cursor.x / client_size.x * 2.0 - 1.0) * aspect,
+        1.0 - cursor.y / client_size.y * 2.0,
+    );
+    let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS
+        / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius_scale));
+    let influence_radius =
+        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius_scale.clamp(0.4, 2.0))
+            .clamp(0.12, 3.0);
+    let radius_squared = influence_radius * influence_radius;
+    let boundary_tolerance = radius_squared * (8.0 * f32::EPSILON);
+    screen.length_squared() <= radius_squared + boundary_tolerance
+}
+
 fn client_size_matches(client_size: IVec2, target_size: UVec2) -> bool {
     (client_size.x - target_size.x as i32).abs() <= 1
         && (client_size.y - target_size.y as i32).abs() <= 1
@@ -143,6 +171,23 @@ fn should_defer_window_resize(pointer_pressed: bool, file_drag_active: bool) -> 
 
 fn should_hit_test_overlay(pointer_locked: bool, cursor_hit: bool, file_drag_active: bool) -> bool {
     pointer_locked || cursor_hit || file_drag_active
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalDragTransition {
+    Start,
+    End,
+    PointerSample { left_button_down: bool },
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn transition_external_drag(active: bool, transition: ExternalDragTransition) -> bool {
+    match transition {
+        ExternalDragTransition::Start => true,
+        ExternalDragTransition::End => false,
+        ExternalDragTransition::PointerSample { left_button_down } => active && left_button_down,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -273,7 +318,11 @@ pub(crate) fn primary_cursor_sample(
 
 #[cfg(target_os = "windows")]
 mod windows_backend {
-    use std::{ffi::c_void, mem::size_of};
+    use std::{
+        ffi::c_void,
+        mem::size_of,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     use bevy::prelude::*;
     use windows::{
@@ -283,8 +332,14 @@ mod windows_backend {
                 GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
                 ScreenToClient,
             },
-            UI::WindowsAndMessaging::{
-                FindWindowW, GetClientRect, GetCursorPos, GetWindowRect, GetWindowThreadProcessId,
+            UI::{
+                Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
+                Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+                WindowsAndMessaging::{
+                    EVENT_SYSTEM_DRAGDROPEND, EVENT_SYSTEM_DRAGDROPSTART, FindWindowW,
+                    GetClientRect, GetCursorPos, GetWindowRect, GetWindowThreadProcessId,
+                    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+                },
             },
         },
         core::PCWSTR,
@@ -292,11 +347,110 @@ mod windows_backend {
 
     use super::*;
 
+    static EXTERNAL_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    pub(super) struct ExternalDragHook {
+        handle: Option<HWINEVENTHOOK>,
+    }
+
+    impl ExternalDragHook {
+        fn install() -> Self {
+            EXTERNAL_DRAG_ACTIVE.store(false, Ordering::Release);
+            // SAFETY: The callback is a process-lifetime function and does not
+            // capture Rust references. Out-of-context delivery runs through the
+            // installing UI thread's message loop.
+            let handle = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_DRAGDROPSTART,
+                    EVENT_SYSTEM_DRAGDROPEND,
+                    None,
+                    Some(external_drag_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+            if handle.is_invalid() {
+                warn!(
+                    "external drag detection is unavailable: {}",
+                    windows::core::Error::from_thread()
+                );
+                Self { handle: None }
+            } else {
+                Self {
+                    handle: Some(handle),
+                }
+            }
+        }
+
+        fn poll_active(&self) -> bool {
+            if self.handle.is_none() {
+                return false;
+            }
+            let active = EXTERNAL_DRAG_ACTIVE.load(Ordering::Acquire);
+            if !active {
+                return false;
+            }
+            let next = transition_external_drag(
+                active,
+                ExternalDragTransition::PointerSample {
+                    left_button_down: left_button_is_down(),
+                },
+            );
+            if active != next {
+                EXTERNAL_DRAG_ACTIVE.store(next, Ordering::Release);
+            }
+            next
+        }
+    }
+
+    impl Drop for ExternalDragHook {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take()
+                // SAFETY: This is the exact handle returned by SetWinEventHook,
+                // retained by this main-thread non-Send resource until teardown.
+                && !unsafe { UnhookWinEvent(handle) }.as_bool()
+            {
+                warn!(
+                    "could not remove external drag event hook: {}",
+                    windows::core::Error::from_thread()
+                );
+            }
+            EXTERNAL_DRAG_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+
+    unsafe extern "system" fn external_drag_event(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        _hwnd: HWND,
+        _object_id: i32,
+        _child_id: i32,
+        _event_thread: u32,
+        _event_time_ms: u32,
+    ) {
+        let transition = match event {
+            EVENT_SYSTEM_DRAGDROPSTART => ExternalDragTransition::Start,
+            EVENT_SYSTEM_DRAGDROPEND => ExternalDragTransition::End,
+            _ => return,
+        };
+        let active = EXTERNAL_DRAG_ACTIVE.load(Ordering::Acquire);
+        EXTERNAL_DRAG_ACTIVE.store(
+            transition_external_drag(active, transition),
+            Ordering::Release,
+        );
+    }
+
+    pub(super) fn initialize_external_drag_hook(world: &mut World) {
+        world.insert_non_send(ExternalDragHook::install());
+    }
+
     pub(super) fn fit_primary_window_to_black_hole(
         time: Res<Time>,
         settings: Res<BlackHoleSettings>,
         mouse_buttons: Res<ButtonInput<MouseButton>>,
         file_drag: Res<DropInteractionState>,
+        external_drag: Option<NonSend<ExternalDragHook>>,
         mut window: Single<&mut Window, With<PrimaryWindow>>,
         mut runtime: ResMut<OverlayWindowRuntime>,
     ) {
@@ -351,7 +505,10 @@ mod windows_backend {
         // OLE file drags.
         if should_defer_window_resize(
             mouse_buttons.any_pressed([MouseButton::Left, MouseButton::Right]),
-            file_drag.drag_active,
+            file_drag.drag_active
+                || external_drag
+                    .as_ref()
+                    .is_some_and(|hook| hook.poll_active()),
         ) {
             return;
         }
@@ -388,25 +545,28 @@ mod windows_backend {
         mut mouse_button_events: MessageReader<MouseButtonInput>,
         controls: Res<BlackHoleControls>,
         settings: Res<BlackHoleSettings>,
-        file_drag: Res<DropInteractionState>,
+        drag_sources: (Res<DropInteractionState>, Option<NonSend<ExternalDragHook>>),
         window: Single<(Entity, &mut CursorOptions), With<PrimaryWindow>>,
         mut runtime: ResMut<OverlayWindowRuntime>,
     ) {
+        let (file_drag, external_drag) = drag_sources;
         let (primary_window, mut cursor_options) = window.into_inner();
-        let cursor_hit = if controls.pass_through() || runtime.resize_pending {
-            false
-        } else {
-            owned_primary_hwnd(&mut runtime)
-                .and_then(cursor_in_client)
-                .is_some_and(|(cursor, client_size)| {
-                    cursor_hits_black_hole(
-                        cursor,
-                        client_size,
-                        controls.pitch(),
-                        settings.lens_radius,
-                    )
-                })
-        };
+        let cursor_sample = owned_primary_hwnd(&mut runtime).and_then(cursor_in_client);
+        let cursor_hit = !controls.pass_through()
+            && !runtime.resize_pending
+            && cursor_sample.is_some_and(|(cursor, client_size)| {
+                cursor_hits_black_hole(cursor, client_size, controls.pitch(), settings.lens_radius)
+            });
+        let external_drag_active = external_drag
+            .as_ref()
+            .is_some_and(|hook| hook.poll_active());
+        let acquiring_external_drag = !controls.pass_through()
+            && !runtime.resize_pending
+            && !runtime.pointer_locked
+            && external_drag_active
+            && cursor_sample.is_some_and(|(cursor, client_size)| {
+                cursor_hits_lens_influence(cursor, client_size, settings.lens_radius)
+            });
 
         let primary_can_own_press = cursor_options.hit_test && cursor_hit;
         for event in mouse_button_events.read() {
@@ -429,8 +589,11 @@ mod windows_backend {
             return;
         }
 
-        let hit =
-            should_hit_test_overlay(runtime.pointer_locked, cursor_hit, file_drag.drag_active);
+        let hit = should_hit_test_overlay(
+            runtime.pointer_locked,
+            cursor_hit,
+            file_drag.drag_active || acquiring_external_drag,
+        );
 
         // Bevy/winit applies this once in `Last`. Avoid marking the component
         // changed every frame, which otherwise repeatedly calls Win32 style APIs.
@@ -472,6 +635,12 @@ mod windows_backend {
         // SAFETY: `process_id` is writable. Invalid/stale handles yield thread id 0.
         let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
         thread_id != 0 && process_id == std::process::id()
+    }
+
+    fn left_button_is_down() -> bool {
+        // The high bit reports the current physical state even while Explorer's
+        // OLE loop owns the pointer and Bevy receives no mouse-button events.
+        unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 }
     }
 
     fn native_geometry(hwnd: HWND) -> Result<NativeGeometry, windows::core::Error> {
@@ -532,6 +701,21 @@ mod windows_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lens_influence_radius(lens_radius_scale: f32) -> f32 {
+        let shadow_radius = CRITICAL_IMPACT_PARAMETER_RS
+            / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_radius_scale));
+        (shadow_radius * BACKGROUND_INFLUENCE_SHADOW_RADII * lens_radius_scale.clamp(0.4, 2.0))
+            .clamp(0.12, 3.0)
+    }
+
+    fn cursor_for_screen_point(screen: Vec2, client_size: Vec2) -> Vec2 {
+        let aspect = client_size.x / client_size.y;
+        Vec2::new(
+            (screen.x / aspect + 1.0) * client_size.x * 0.5,
+            (1.0 - screen.y) * client_size.y * 0.5,
+        )
+    }
 
     #[test]
     fn client_size_tracks_apparent_size_until_monitor_limit() {
@@ -609,6 +793,46 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_left_button_activity_cannot_start_an_external_drag() {
+        // A normal click, text selection, or window move only changes the
+        // physical button state. Without DRAGDROPSTART it must remain inactive.
+        assert!(!transition_external_drag(
+            false,
+            ExternalDragTransition::PointerSample {
+                left_button_down: true,
+            },
+        ));
+        assert!(!transition_external_drag(
+            false,
+            ExternalDragTransition::PointerSample {
+                left_button_down: false,
+            },
+        ));
+    }
+
+    #[test]
+    fn external_drag_requires_start_and_clears_on_end_or_button_release() {
+        let active = transition_external_drag(false, ExternalDragTransition::Start);
+        assert!(active);
+        assert!(transition_external_drag(
+            active,
+            ExternalDragTransition::PointerSample {
+                left_button_down: true,
+            },
+        ));
+        assert!(!transition_external_drag(
+            active,
+            ExternalDragTransition::End
+        ));
+        assert!(!transition_external_drag(
+            active,
+            ExternalDragTransition::PointerSample {
+                left_button_down: false,
+            },
+        ));
+    }
+
+    #[test]
     fn native_cursor_sample_converts_physical_pixels_to_bevy_logical_units() {
         assert_eq!(
             logical_cursor_sample(Vec2::new(600.0, 300.0), Vec2::new(1_800.0, 1_400.0), 2.0),
@@ -635,6 +859,107 @@ mod tests {
                     / (CAMERA_DISTANCE_RS * render_tan_half_fov(lens_scale));
             assert!(radius <= CONTENT_SAFE_RADIUS + 1.0e-5);
         }
+    }
+
+    #[test]
+    fn lens_influence_contains_the_client_center() {
+        let size = Vec2::new(1_600.0, 900.0);
+        for lens_scale in [0.4, 1.0, 2.0] {
+            assert!(cursor_hits_lens_influence(size * 0.5, size, lens_scale));
+        }
+    }
+
+    #[test]
+    fn lens_influence_accounts_for_client_aspect_ratio() {
+        let wide = Vec2::new(1_600.0, 800.0);
+
+        // Equal fractional offsets are not equal camera-space distances in a
+        // wide client: the horizontal point is twice as far from the center.
+        assert!(!cursor_hits_lens_influence(
+            Vec2::new(wide.x * 0.75, wide.y * 0.5),
+            wide,
+            1.0,
+        ));
+        assert!(cursor_hits_lens_influence(
+            Vec2::new(wide.x * 0.5, wide.y * 0.75),
+            wide,
+            1.0,
+        ));
+
+        // Conversely, equal pixel offsets along either axis land on the same
+        // circular lens boundary after aspect correction.
+        let radius_pixels = lens_influence_radius(1.0) * wide.y * 0.5;
+        for offset in [Vec2::X, Vec2::Y] {
+            assert!(cursor_hits_lens_influence(
+                wide * 0.5 + offset * radius_pixels * 0.999,
+                wide,
+                1.0,
+            ));
+            assert!(!cursor_hits_lens_influence(
+                wide * 0.5 + offset * radius_pixels * 1.001,
+                wide,
+                1.0,
+            ));
+        }
+    }
+
+    #[test]
+    fn lens_influence_includes_its_exact_boundary_and_rejects_outside() {
+        let size = Vec2::new(1_280.0, 720.0);
+        let radius = lens_influence_radius(1.0);
+
+        for direction in [Vec2::X, Vec2::Y, Vec2::new(0.6, 0.8)] {
+            let boundary = cursor_for_screen_point(direction * radius, size);
+            let inside = cursor_for_screen_point(direction * radius * 0.999, size);
+            let outside = cursor_for_screen_point(direction * radius * 1.001, size);
+            assert!(cursor_hits_lens_influence(boundary, size, 1.0));
+            assert!(cursor_hits_lens_influence(inside, size, 1.0));
+            assert!(!cursor_hits_lens_influence(outside, size, 1.0));
+        }
+    }
+
+    #[test]
+    fn lens_influence_rejects_zero_and_subpixel_client_sizes() {
+        for size in [
+            Vec2::ZERO,
+            Vec2::splat(f32::MIN_POSITIVE),
+            Vec2::new(1.0, 720.0),
+            Vec2::new(1_280.0, 1.0),
+            Vec2::new(-1.0, 720.0),
+        ] {
+            assert!(!cursor_hits_lens_influence(Vec2::ZERO, size, 1.0));
+        }
+    }
+
+    #[test]
+    fn lens_influence_clamps_finite_extremes_and_rejects_non_finite_inputs() {
+        let size = Vec2::new(1_280.0, 720.0);
+        let samples = [size * 0.5, size * Vec2::new(0.6, 0.5), Vec2::ZERO];
+
+        for cursor in samples {
+            assert_eq!(
+                cursor_hits_lens_influence(cursor, size, -f32::MAX),
+                cursor_hits_lens_influence(cursor, size, 0.4),
+            );
+            assert_eq!(
+                cursor_hits_lens_influence(cursor, size, f32::MAX),
+                cursor_hits_lens_influence(cursor, size, 2.0),
+            );
+        }
+
+        for lens_scale in [f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            assert!(!cursor_hits_lens_influence(size * 0.5, size, lens_scale));
+        }
+        assert!(!cursor_hits_lens_influence(
+            Vec2::splat(f32::NAN),
+            size,
+            1.0,
+        ));
+        assert!(!cursor_hits_lens_influence(
+            size * 0.5,
+            Vec2::new(f32::INFINITY, size.y),
+            1.0,
+        ));
     }
 
     #[test]

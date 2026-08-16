@@ -1,5 +1,36 @@
 use bevy::prelude::Resource;
 
+use std::time::Duration;
+
+/// User-selectable update and render cadence for the desktop effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FrameRateLimit {
+    Fps30,
+    #[default]
+    Fps60,
+    Fps120,
+}
+
+impl FrameRateLimit {
+    pub const ALL: [Self; 3] = [Self::Fps30, Self::Fps60, Self::Fps120];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fps30 => "30 FPS",
+            Self::Fps60 => "60 FPS（推荐）",
+            Self::Fps120 => "120 FPS",
+        }
+    }
+
+    pub fn frame_time(self) -> Duration {
+        Duration::from_secs_f64(match self {
+            Self::Fps30 => 1.0 / 30.0,
+            Self::Fps60 => 1.0 / 60.0,
+            Self::Fps120 => 1.0 / 120.0,
+        })
+    }
+}
+
 /// User-facing quality presets shared by the ray integrator and desktop capture.
 ///
 /// The values intentionally live outside the shader material. This keeps the
@@ -130,6 +161,7 @@ pub struct BlackHoleSettings {
     pub exposure: f32,
     pub render_quality: RenderQuality,
     pub anti_aliasing: AntiAliasingMode,
+    pub frame_rate_limit: FrameRateLimit,
 }
 
 impl Default for BlackHoleSettings {
@@ -150,6 +182,7 @@ impl Default for BlackHoleSettings {
             exposure: 1.0,
             render_quality: RenderQuality::Balanced,
             anti_aliasing: AntiAliasingMode::Smaa,
+            frame_rate_limit: FrameRateLimit::Fps60,
         }
     }
 }
@@ -214,6 +247,18 @@ mod tests {
         assert_eq!(
             BlackHoleSettings::default().anti_aliasing,
             AntiAliasingMode::Smaa
+        );
+    }
+
+    #[test]
+    fn frame_rate_options_are_exactly_the_three_supported_tiers() {
+        assert_eq!(FrameRateLimit::ALL.len(), 3);
+        assert_eq!(FrameRateLimit::Fps30.frame_time().as_nanos(), 33_333_333);
+        assert_eq!(FrameRateLimit::Fps60.frame_time().as_nanos(), 16_666_667);
+        assert_eq!(FrameRateLimit::Fps120.frame_time().as_nanos(), 8_333_333);
+        assert_eq!(
+            BlackHoleSettings::default().frame_rate_limit,
+            FrameRateLimit::Fps60
         );
     }
 
