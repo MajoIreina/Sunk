@@ -1,57 +1,43 @@
 # Sunk Delivery Roadmap
 
-## Phase 0: technical foundation (current)
+## Native renderer prototype (complete)
 
-- [x] Rust workspace and stable dependency baseline
-- [x] Transparent, borderless, always-on-top window configuration
-- [x] DirectComposition-backed DX12 surface on Windows
-- [x] Procedural lensed-disk WGSL black-hole prototype
-- [x] Core interaction state machine and adaptive quality policy
-- [x] Safe settings and filesystem boundaries
-- [x] Cross-platform CI and binary-size check
-- [x] Windows DX12 transparency and visual smoke test
-- [ ] Real macOS Metal transparency smoke test
-- [ ] Documented macOS visual smoke-test results
+- [x] Rust 2024 single-package application with locked dependencies
+- [x] Windows DX12 and DirectComposition transparent presentation
+- [x] WGSL embedded into the executable and explicit Dynamic DXC selection
+- [x] Adaptive Schwarzschild null-ray integration with CPU reference tests
+- [x] Soft, layered, differentially rotating accretion-disk clouds
+- [x] Doppler, gravitational shift, Beer-Lambert transfer, and photon-ring response
+- [x] Live desktop capture with geodesic displacement and recursive-capture prevention
+- [x] Window size following apparent black-hole size with monitor work-area limits
+- [x] Content-shaped hit testing and transparent click-through
+- [x] Chinese General, Display, Quality, and About settings pages
+- [x] Notification-area restore and exit controls
+- [x] SMAA and four-pass SSAA 2x2 paths with explicit TAA/MSAA status
+- [x] Windows CI for formatting, strict Clippy, tests, locked Release build, and size gate
 
-### Windows smoke result (2026-08-13)
+## Rendering and capture hardening
 
-- Windows 11 build 26220, NVIDIA GeForce RTX 5080, 640 x 640 physical render size
-- Procedural black hole is nonblank and remains responsive after hide/restore
-- Window corners match the unobscured desktop exactly; no opaque rectangular background
-- Captured-ray shadow is opaque black while all pixels outside emitted light remain transparent
-- Lensed rear disk appears above and below the shadow; left/right luminance ratio is about 2.24:1
-- Idle sample: about 0.13% GPU 3D engine usage and 0.05% total CPU usage
-- Release executable: 2.57 MiB, below the 50 MiB binary gate
+- [ ] Replace GDI readback with Windows Graphics Capture and a proven shared-texture bridge
+- [ ] Add GPU timestamp queries and sustained adaptive-quality decisions
+- [ ] Add a Kerr spacetime option with validated spin and frame-dragging behavior
+- [ ] Investigate temporal reconstruction only after motion, depth, alpha-history, and desktop-latency inputs are reliable
+- [ ] Build automated transparent-surface and nonblank canvas smoke checks for CI-capable hardware
 
-## Phase 1: interactive renderer
+## Desktop integration
 
-- Refine the cinematic Kerr-spin approximation and camera controls
-- [x] Drag-session aggregation for multiple paths
-- [x] Deterministic path-free capture/orbit/event-horizon timeline
-- [ ] Per-target file-object capture/orbit/event-horizon rendering
-- Off-screen HDR target, bloom, tonemapping, and final composite
-- GPU timestamp queries with CPU fallback and explicit metric labels
-- Resolution scaling and ray-step changes wired to the renderer
+- [ ] Complete manual coverage for 100%, 150%, and 200% DPI across mixed-monitor layouts
+- [ ] Complete repeated tray restore, explorer/dialog click-through, sleep/wake, and display-change tests
+- [ ] Persist settings with schema migration and corruption recovery
+- [ ] Add an explicit opt-in global shortcut for settings recovery
+- [ ] Replace the prototype capture rate policy with measured bandwidth and latency targets
 
-## Phase 2: desktop integration
+## Release engineering
 
-- Explicit `Interactive` and `PassThrough` window modes
-- Tray/menu recovery path for `Interactive` mode
-- Explorer/Finder drag-and-drop acceptance tests (Windows implementation smoke-tested; macOS pending)
-- DPI, multiple-monitor, sleep/wake, and display-change handling
+- [ ] Pin the distributable DXC runtime source, version, SHA-256 values, and redistribution notice
+- [ ] Define whether the Visual C++ runtime is bundled or installed as a prerequisite
+- [ ] Produce a signed Windows bundle and installer
+- [ ] Add crash reporting and update behavior only after privacy and consent requirements are approved
+- [ ] Establish reference GPU, resolution, frame-rate, memory, and bundle-size acceptance gates
 
-## Phase 3: safe file operations
-
-- Operation coordinator outside the render loop
-- Move-to-trash preview, validation, cancellation, and completion events
-- Symlink/alias/shortcut behavior specification
-- No permanent deletion until confirmation UX and recovery policy are approved
-
-## Release definition gaps
-
-Before enforcing product acceptance, define:
-
-- the reference GPU and physical render resolution for the 60 FPS target;
-- whether the 50 MB limit applies to the executable, signed app bundle, installer, or archive;
-- minimum supported Windows and macOS versions;
-- signing, notarization, update, and crash-report privacy requirements.
+`Sunk_Desktop_Development_Document_v0.1.docx` remains the historical product baseline. This roadmap and the current source describe the implemented renderer after the native Rust replacement.

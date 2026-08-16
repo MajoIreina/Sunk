@@ -1,84 +1,57 @@
-# Architecture Baseline
+# Current Architecture
 
-## Phase 0 vertical slice
+## Product boundary
 
-The initial workspace intentionally implements six cohesive modules instead of creating every
-future crate as an empty placeholder. New modules should be extracted only when they own real
-behavior and tests.
+Sunk is a native Rust Windows desktop renderer. It presents a physically motivated black hole in a borderless, always-on-top transparent window, bends a captured copy of the desktop through the integrated light path, and exposes live controls in a separate Chinese settings window.
+
+The current implementation is one executable package. The previous six-crate Phase 0 workspace is retained in Git history and in `backup/pre-rust-refactor-20260816`; it is not the runtime architecture of `main`.
 
 ```text
-sunk-app
-  |-- sunk-core
-  |-- sunk-desktop
-  |-- sunk-renderer
-  |-- sunk-settings
-  `-- sunk-filesystem (not invoked by the prototype)
+src/main.rs
+  |-- black_hole.rs          Bevy material, render passes, and embedded WGSL
+  |-- desktop_capture.rs     Windows desktop capture and GPU texture upload
+  |-- physics.rs             CPU reference equations and invariants
+  |-- settings.rs            Sanitized render and interaction settings
+  |-- settings_ui.rs         Chinese egui settings window
+  |-- system_tray.rs         Notification-area recovery and exit commands
+  `-- window_interaction.rs  Window fitting, dragging, orbit, and hit testing
+
+assets/shaders/black_hole.wgsl
+  `-- Embedded into sunk.exe at compile time
 ```
 
-`sunk-core` has no dependency on `winit`, `wgpu`, or platform APIs. The renderer accepts only
-renderer-facing values such as `RenderQuality`. The filesystem crate owns OS trash integration and
-is not reachable from the renderer.
+## Graphics and transparency contract
 
-## Transparency contract
+The validated production path is Windows DX12 with wgpu's DirectComposition Visual presentation system. The primary surface uses premultiplied RGBA and clears to transparent. Escaped rays add no synthetic sky or star field; pixels are visible only when they contain emitted black-hole light, the opaque captured-ray shadow, or meaningfully displaced desktop content.
 
-Windows uses the DX12 DirectComposition presentation path (`DxgiFromVisual`) together with a
-no-redirection-bitmap window and prefers `PreMultiplied` alpha, which DirectComposition accepts
-reliably. macOS uses Metal and prefers `PostMultiplied` alpha. An opaque-only surface is treated as
-an initialization error rather than silently showing a black rectangle.
+The application explicitly selects DX12 and Dynamic DXC. Startup requires a matching `dxcompiler.dll` and `dxil.dll` pair, discovered beside `sunk.exe`, through `SUNK_DXCOMPILER_PATH`, or in an installed Windows SDK. It does not silently fall back to FXC or another presentation backend.
 
-The final pass writes RGB in the alpha representation selected for the platform and clears to fully
-transparent. Future bloom and ray passes must render to off-screen textures, followed by a final
-compositing render pass. Compute shaders must not write directly to the swapchain.
+The WGSL source is registered as a Bevy internal asset with `embedded_asset!`. A deployed executable therefore does not require the source `assets` directory. The source remains tracked for review, validation, and reproducible builds.
 
-## Gargantua visual contract
+## Light integration and disk material
 
-The Phase 0 shader now traces an inexpensive Schwarzschild-style light path through a tilted,
-procedural accretion disk. Multiple disk-plane crossings produce the recognizable upper and lower
-lensed images instead of a flat Saturn-like ellipse. Orbital velocity drives Doppler beaming and
-color shift, while gravitational redshift, a narrow photon ring, and an opaque captured-ray shadow
-complete the visual hierarchy. This is a cinematic approximation rather than a scientific Kerr
-simulation; a future renderer may add spin and a physically derived camera model without changing
-the transparent-window contract.
+The fragment shader integrates Schwarzschild null paths in Schwarzschild-radius units. Quality presets use a midpoint performance path or adaptive RK4 with progressively larger integration budgets. Segment-to-horizon tests prevent a large adaptive step from tunneling through the captured region. CPU f64 tests independently check characteristic radii, the critical impact boundary, and invariant drift.
 
-Pixels outside the black hole and its emitted light remain fully transparent. The shader cannot
-lens the live desktop behind the window because that desktop is not available as a sampled texture.
+The accretion disk combines a porous ray-plane photosphere with a layered cloud volume. Domain-warped noise is advected with Keplerian `r^-3/2` differential rotation. Beer-Lambert front-to-back transfer, a zero-torque temperature profile, Doppler beaming, and gravitational frequency shift produce the visible material and color response.
 
-## Runtime policy
+SMAA operates as a Bevy post-process on the transparent primary camera. SSAA 2x2 renders four deterministic subpixel geodesic passes with additive premultiplied blending. TAA and MSAA remain visible but unavailable because the ray marcher does not provide reliable motion/depth history and its important edges are generated inside the fragment shader rather than at triangle coverage boundaries.
 
-- Interaction refresh target: approximately 60 Hz.
-- Idle refresh target: approximately 10 Hz.
-- Quality changes use wall-clock sustained thresholds to avoid oscillation.
-- Ray integration uses five distinct budgets: 64, 72, 80, 88, and 96 steps. The 64-step floor
-  preserves both lensed disk images; idle savings primarily come from the 10 Hz frame rate.
-- The current timing sample measures CPU submission time, not GPU time. True GPU timing requires
-  checking `TIMESTAMP_QUERY` support and is deferred to the performance milestone.
+## Desktop lensing
 
-## File safety
+The Windows backend captures an overscanned physical region of the monitor through GDI and uploads it as an sRGB texture. The renderer HWND is temporarily excluded from capture to prevent recursive feedback. Failed overscan falls back to the client region and is retried later.
 
-The default policy is trash-only. `FileSystemService` exposes inspection and move-to-trash; it does
-not expose permanent deletion. The Phase 0 application does not call either operation. A future
-operation coordinator must perform validation outside the renderer and report completion through
-domain events.
+An escaped integrated ray and its straight reference ray intersect the same finite background plane. Their displacement is combined with conserved impact parameter, closest approach, and path-length response. A physical far-field falloff returns the window edge to transparency without replacing geodesic deformation with a fixed circular UV mask.
 
-## Drag-and-capture boundary
+The capture implementation is intentionally isolated behind `DesktopCaptureState`. A future Windows Graphics Capture and shared-texture backend can replace the GDI readback without changing the shader or settings contract.
 
-`winit` emits one hover or drop event per path and does not expose a public end-of-drop event. The
-desktop layer therefore collects paths in first-seen order and the application flushes them when the
-event loop is about to wait. On the supported Windows and macOS backends, all paths from one native
-drop are emitted together, so this preserves a multi-file drop as one event-loop-coalesced batch. It
-is not described as a platform-level transaction because two unrealistically close native drops
-could theoretically be coalesced.
+## Windows, input, and settings
 
-The core validates each batch atomically, rejects empty paths and batches above 256 unique targets,
-and drives a bounded deterministic visual queue. Each target retains its own single-path state
-machine. Renderer-facing snapshots contain only a generated visual identifier, phase, progress, and
-orbit lane; paths never cross into the renderer. The visual timeline stops at the event horizon and
-does not emit consumption-complete events or invoke the filesystem service.
+The primary window tracks apparent black-hole size and lens influence while keeping the outer visible edge inside an 88% safe radius of the current monitor work area. A resize remains click-through until native client dimensions confirm the requested geometry.
 
-## Deferred platform work
+Dynamic hit testing claims pointer input only over the central shadow/photon ring and projected emitting disk. Transparent corners and desktop-only lens pixels pass clicks to underlying applications. A drag remains owned only if its press began on interactive primary-window content.
 
-- Per-target file-object rendering and visual orbit animation
-- Interactive and click-through window modes
-- Native application discovery and uninstall
-- Audio and update services
-- Signing, notarization, packaging, and installer-size gates
+The independent egui window contains General, Display, Quality, and About pages in Chinese. Closing or minimizing it hides it to the Windows notification area. The tray icon restores settings or exits the application.
+
+## Deployment boundary
+
+A runnable Windows bundle currently consists of `sunk.exe`, a matching DXC runtime pair, and the applicable Microsoft Visual C++ runtime. Packaging must record the DXC source, version, hashes, and redistribution terms. Signing, installer generation, and update delivery remain release work.

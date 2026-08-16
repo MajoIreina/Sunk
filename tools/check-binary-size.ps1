@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$Path,
 
-    [int64]$LimitBytes = 50MB
+    [int64]$LimitBytes = 128MB
 )
 
 $binary = Get-Item -LiteralPath $Path -ErrorAction Stop

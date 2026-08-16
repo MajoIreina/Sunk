@@ -1,4 +1,6 @@
 /target/
+/artifacts/
+*.log
 *.pdb
 *.dSYM/
 .DS_Store
