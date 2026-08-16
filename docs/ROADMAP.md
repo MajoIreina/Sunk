@@ -65,8 +65,9 @@ These checks are intentionally open. Checked implementation items above do not c
 
 ## Release engineering
 
-- [ ] Pin the distributable DXC runtime source, version, SHA-256 values, and redistribution notice
-- [ ] Define whether the Visual C++ runtime is bundled or installed as a prerequisite
+- [x] Pin Microsoft DirectXShaderCompiler v1.9.2607, its official archive and DLL SHA-256 values, and bundle the upstream license files
+- [x] Require the Microsoft Visual C++ 2015-2022 Redistributable (x64) as a system prerequisite instead of bundling it
+- [x] Produce a scripted unsigned v0.0.1 Windows x64 portable Beta bundle with internal and external SHA-256 manifests
 - [ ] Produce a signed Windows bundle and installer
 - [ ] Add crash reporting and update behavior only after privacy and consent requirements are approved
 - [ ] Establish reference GPU, resolution, frame-rate, memory, and bundle-size acceptance gates

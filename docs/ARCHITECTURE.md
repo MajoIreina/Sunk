@@ -100,4 +100,6 @@ The rollback branch `backup/pre-file-operations-20260816` fixes the pre-feature 
 
 ## Deployment boundary
 
-A runnable Windows bundle currently consists of `sunk.exe`, a matching DXC runtime pair, and the applicable Microsoft Visual C++ runtime. Packaging must record the DXC source, version, hashes, and redistribution terms. Signing, installer generation, and update delivery remain release work.
+The v0.0.1 Windows x64 portable bundle consists of `sunk.exe`, the official Microsoft DirectXShaderCompiler v1.9.2607 x64 runtime pair, project, DXC, and resolved Rust dependency license files, release notes, and SHA-256 manifests. WGSL remains embedded and no source `assets` directory is deployed. The Microsoft Visual C++ 2015-2022 Redistributable (x64) is a system prerequisite rather than a bundled component.
+
+`THIRD_PARTY_NOTICES.md` records the pinned DXC source archive and binary hashes. The packaging script rejects a version mismatch, missing runtime pair, missing notices, an oversized executable, or a non-empty destination. Code signing, installer generation, and update delivery remain future release work.

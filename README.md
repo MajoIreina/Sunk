@@ -2,6 +2,12 @@
 
 Native Rust prototype for a physically motivated black-hole desktop renderer. It draws a Schwarzschild black hole and accretion disk into a borderless, always-on-top, transparent window. There is deliberately no skybox or star background: escaped rays are transparent unless they are used to lens captured desktop pixels.
 
+## Beta release
+
+The first public beta is [Sunk v0.0.1](https://github.com/MajoIreina/Sunk/releases/tag/v0.0.1). Download `Sunk-v0.0.1-windows-x64.zip`, extract the complete folder, and run `sunk.exe`. The portable bundle includes the matching DXC runtime, project and dependency licenses, and SHA-256 manifests; the source `assets` directory is not required.
+
+The beta supports 64-bit Windows 10 version 2004 / build 19041 or newer with a current DX12-capable GPU driver. The [Microsoft Visual C++ 2015-2022 Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe) is a system prerequisite and is not bundled. This build is not code-signed, so Windows may show a SmartScreen warning. There is no installer or automatic updater yet.
+
 ## Run
 
 Requirements: Windows 10 version 2004 / build 19041 or newer, a current GPU driver, Rust 1.95 or newer (the repository pins Rust 1.97.1), and the DXC 1.8.2502 runtime or newer.

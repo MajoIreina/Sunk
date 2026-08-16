@@ -23,3 +23,14 @@ The shader and Rust source in this repository are an independent implementation.
 The inspected `BlackHole_Urp` main revision targets Unity `6000.2.10f1` with URP 17.2, not Unity 2022.3/URP 14. It remains useful as a visual reference, but exact Unity 2022.3 parity requires an older pinned revision or a separate baseline project. Its active shader also hard-codes zero spin; this project therefore describes the current model as Schwarzschild, not Kerr.
 
 The physical identities used by this project—including `r_s = 2GM/c²`, the Schwarzschild photon-orbit equation, relativistic Doppler shift, and Beer–Lambert attenuation—are implemented from their mathematical definitions.
+
+## Distributed DXC runtime
+
+The Windows portable release includes unmodified x64 runtime binaries from Microsoft DirectXShaderCompiler `v1.9.2607`, official asset `dxc_2026_07_29.zip`:
+
+- Source: <https://github.com/microsoft/DirectXShaderCompiler/releases/tag/v1.9.2607>
+- Archive SHA-256: `a1dfb116ba3eeae6a1582291b53a8e7bf65ad760676bd3194685c8f7367cd241`
+- `dxcompiler.dll` SHA-256: `9a5100511e127c6a2fc78edf984f95074a76d35b90c90c4d342430a5ae160e9b`
+- `dxil.dll` SHA-256: `feb57253eff0a622561e29b44cedbe86b89fc9a5bc8dc00fa2f98fafd712c2d8`
+
+The release bundle includes the upstream `LICENCE-MIT.txt`, `LICENSE-LLVM.txt`, and `LICENSE-MS.txt` files without modification under `licenses/DirectXShaderCompiler/`. Sunk does not claim ownership of those runtime binaries.
